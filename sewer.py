@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import io
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from streamlit_plotly_events import plotly_events
 
@@ -1762,7 +1763,13 @@ if st.session_state.df_clean is not None:
     # Graphical selection helper
     st.markdown("### Graphical selection assistant")
 
-    selection_cols = ["timestamp", "depth_clean", "velocity_clean"]
+    selection_cols = [
+        "timestamp",
+        "depth",
+        "velocity",
+        "depth_clean",
+        "velocity_clean",
+    ]
     if "depth_quality" in df_clean.columns:
         selection_cols.append("depth_quality")
     if "velocity_quality" in df_clean.columns:
@@ -1770,6 +1777,7 @@ if st.session_state.df_clean is not None:
 
     plot_df = df_clean[selection_cols].copy()
     plot_df["row_id"] = df_clean.index
+    plot_df["order_idx"] = np.arange(len(plot_df))
 
     def update_manual_mask(name: str, base: pd.Series, row_ids: List[int], value: bool):
         mask = current_manual_mask(name, base).copy()
@@ -1777,36 +1785,97 @@ if st.session_state.df_clean is not None:
             mask.loc[row_ids] = value
         st.session_state[name] = mask
 
-    # Depth selection chart
-    st.markdown("#### Depth selection")
-    fig_depth_select = px.scatter(
-        plot_df,
-        x="timestamp",
-        y="depth_clean",
-        color="depth_quality" if "depth_quality" in plot_df.columns else None,
-        title="Highlight depth samples (box-select / lasso across plot)",
-        labels={"depth_clean": "Depth (m)", "timestamp": "Time"},
-    )
-    fig_depth_select.update_layout(dragmode="select")
-    fig_depth_select.update_traces(marker=dict(size=6))
+    def category_colors(series: pd.Series, palette=None) -> pd.Series:
+        if palette is None:
+            palette = {
+                "good_raw": "#1f77b4",
+                "inferred_rating": "#2ca02c",
+                "inferred_diurnal": "#ff7f0e",
+                "inferred_shape": "#9467bd",
+                "inferred_time": "#8c564b",
+                "raw_bad": "#d62728",
+                "missing": "#7f7f7f",
+            }
+        return series.map(palette).fillna("#7f7f7f")
 
-    depth_points = plotly_events(
+    def make_selection_chart(y_raw: str, y_clean: str, quality_col: Optional[str], title: str, y_label: str):
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=plot_df["timestamp"],
+                y=plot_df[y_raw],
+                mode="lines",
+                name=f"{y_label} raw",
+                line=dict(color="#9e9e9e", width=1),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=plot_df["timestamp"],
+                y=plot_df[y_clean],
+                mode="lines",
+                name=f"{y_label} cleaned",
+                line=dict(color="#1f77b4", width=2),
+            )
+        )
+        marker_colors = None
+        marker_text = None
+        if quality_col and quality_col in plot_df.columns:
+            marker_colors = category_colors(plot_df[quality_col])
+            marker_text = plot_df[quality_col].astype(str)
+        fig.add_trace(
+            go.Scatter(
+                x=plot_df["timestamp"],
+                y=plot_df[y_clean],
+                mode="markers",
+                name="Select points",
+                marker=dict(size=7, color=marker_colors, opacity=0.9),
+                customdata=np.stack([plot_df["row_id"], plot_df["order_idx"]], axis=1),
+                hovertemplate="%{y:.3f}<br>%{x}<br>%{text}<extra></extra>",
+                text=marker_text,
+            )
+        )
+        fig.update_layout(
+            title=title,
+            dragmode="select",
+            xaxis_title="Timestamp",
+            yaxis_title=y_label,
+            legend_title="Series",
+            height=400,
+        )
+        return fig
+
+    def extract_row_ids(events: List[Dict[str, Any]]) -> List[int]:
+        row_ids: List[int] = []
+        if not events:
+            return row_ids
+        for pt in events:
+            cd = pt.get("customdata")
+            if isinstance(cd, (list, tuple)) and len(cd) >= 1:
+                try:
+                    row_ids.append(int(cd[0]))
+                except Exception:
+                    continue
+        return row_ids
+
+    # Depth selection chart (raw + cleaned on time x-axis)
+    st.markdown("#### Depth selection (time on X)")
+    fig_depth_select = make_selection_chart(
+        y_raw="depth",
+        y_clean="depth_clean",
+        quality_col="depth_quality" if "depth_quality" in plot_df.columns else None,
+        title="Depth over time (select to flag good/bad)",
+        y_label="Depth (m)",
+    )
+    depth_events = plotly_events(
         fig_depth_select,
         select_event=True,
-        override_height=360,
+        override_height=400,
         key="depth_plotly_select",
     )
-
-    depth_row_ids: List[int] = []
-    if depth_points:
-        depth_indices = [
-            pt.get("pointIndex", pt.get("pointNumber"))
-            for pt in depth_points
-            if pt.get("pointIndex", pt.get("pointNumber")) is not None
-        ]
-        if depth_indices:
-            depth_row_ids = plot_df.iloc[depth_indices]["row_id"].tolist()
-            st.info(f"Depth chart: selected {len(depth_row_ids)} samples.")
+    depth_row_ids = extract_row_ids(depth_events)
+    if depth_row_ids:
+        st.info(f"Depth chart: selected {len(depth_row_ids)} samples.")
 
     depth_cols = st.columns(2)
     if depth_cols[0].button(
@@ -1826,36 +1895,24 @@ if st.session_state.df_clean is not None:
         st.success("Depth selection marked as bad.")
         st.rerun()
 
-    # Velocity selection chart
-    st.markdown("#### Velocity selection")
-    fig_vel_select = px.scatter(
-        plot_df,
-        x="timestamp",
-        y="velocity_clean",
-        color="velocity_quality" if "velocity_quality" in plot_df.columns else None,
-        title="Highlight velocity samples (box-select / lasso across plot)",
-        labels={"velocity_clean": "Velocity (m/s)", "timestamp": "Time"},
+    # Velocity selection chart (raw + cleaned on time x-axis)
+    st.markdown("#### Velocity selection (time on X)")
+    fig_vel_select = make_selection_chart(
+        y_raw="velocity",
+        y_clean="velocity_clean",
+        quality_col="velocity_quality" if "velocity_quality" in plot_df.columns else None,
+        title="Velocity over time (select to flag good/bad)",
+        y_label="Velocity (m/s)",
     )
-    fig_vel_select.update_layout(dragmode="select")
-    fig_vel_select.update_traces(marker=dict(size=6))
-
-    velocity_points = plotly_events(
+    velocity_events = plotly_events(
         fig_vel_select,
         select_event=True,
-        override_height=360,
+        override_height=400,
         key="velocity_plotly_select",
     )
-
-    velocity_row_ids: List[int] = []
-    if velocity_points:
-        velocity_indices = [
-            pt.get("pointIndex", pt.get("pointNumber"))
-            for pt in velocity_points
-            if pt.get("pointIndex", pt.get("pointNumber")) is not None
-        ]
-        if velocity_indices:
-            velocity_row_ids = plot_df.iloc[velocity_indices]["row_id"].tolist()
-            st.info(f"Velocity chart: selected {len(velocity_row_ids)} samples.")
+    velocity_row_ids = extract_row_ids(velocity_events)
+    if velocity_row_ids:
+        st.info(f"Velocity chart: selected {len(velocity_row_ids)} samples.")
 
     velocity_cols = st.columns(2)
     if velocity_cols[0].button(
