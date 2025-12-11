@@ -612,6 +612,8 @@ def apply_quality_checks(
     capacity_tolerance: float = 0.1,
     condition_labels: Optional[pd.Series] = None,
     rainfall_context: Optional[Dict[str, pd.Series]] = None,
+    manual_depth_mask: Optional[pd.Series] = None,
+    manual_velocity_mask: Optional[pd.Series] = None,
 ):
     """
     Add depth_flag and velocity_flag columns (True = good).
@@ -757,6 +759,32 @@ def apply_quality_checks(
         tracker.add(overload, "capacity_exceeded", "velocity")
         vel_flag &= ~overload
 
+    manual_depth_series: Optional[pd.Series] = None
+    manual_velocity_series: Optional[pd.Series] = None
+    if manual_depth_mask is not None:
+        manual_depth_series = manual_depth_mask.reindex(df.index)
+        manual_depth_series = manual_depth_series.where(~manual_depth_series.isna(), depth_flag)
+        manual_depth_series = manual_depth_series.astype(bool)
+    if manual_velocity_mask is not None:
+        manual_velocity_series = manual_velocity_mask.reindex(df.index)
+        manual_velocity_series = manual_velocity_series.where(~manual_velocity_series.isna(), vel_flag)
+        manual_velocity_series = manual_velocity_series.astype(bool)
+
+    depth_flag_auto = depth_flag.copy()
+    vel_flag_auto = vel_flag.copy()
+
+    if manual_depth_series is not None:
+        override_mask = manual_depth_series != depth_flag
+        tracker.add(override_mask & manual_depth_series, "manual_override_good", "depth")
+        tracker.add(override_mask & (~manual_depth_series), "manual_override_bad", "depth")
+        depth_flag = manual_depth_series
+
+    if manual_velocity_series is not None:
+        override_mask_v = manual_velocity_series != vel_flag
+        tracker.add(override_mask_v & manual_velocity_series, "manual_override_good", "velocity")
+        tracker.add(override_mask_v & (~manual_velocity_series), "manual_override_bad", "velocity")
+        vel_flag = manual_velocity_series
+
     # Rating curve consistency: depth is generally trusted, so we only
     # use the curve to mark velocity outliers here.
     combined_good = depth_flag & vel_flag
@@ -832,6 +860,8 @@ def apply_quality_checks(
 
     df["depth_flag"] = depth_flag
     df["velocity_flag"] = vel_flag
+    df["depth_flag_auto"] = depth_flag_auto
+    df["velocity_flag_auto"] = vel_flag_auto
     df["depth_anomaly_codes"] = tracker.series("depth")
     df["velocity_anomaly_codes"] = tracker.series("velocity")
     return d_knots, v_knots, v_expected, d_expected, tracker
@@ -1323,6 +1353,8 @@ def process_dataset(
     capacity_tolerance: float = 0.1,
     condition_labels: Optional[pd.Series] = None,
     rainfall_context: Optional[Dict[str, pd.Series]] = None,
+    manual_depth_mask: Optional[pd.Series] = None,
+    manual_velocity_mask: Optional[pd.Series] = None,
 ):
     d_knots, v_knots, v_expected, d_expected, tracker = apply_quality_checks(
         df,
@@ -1348,6 +1380,8 @@ def process_dataset(
             if condition_labels is not None
             else rainfall_context.get("condition_label") if rainfall_context else None
         ),
+        manual_depth_mask=manual_depth_mask,
+        manual_velocity_mask=manual_velocity_mask,
     )
 
     if v_expected is None or d_expected is None:
@@ -1537,6 +1571,14 @@ if "df_clean" not in st.session_state:
     st.session_state.df_clean = None
 if "pipe_diam_m" not in st.session_state:
     st.session_state.pipe_diam_m = None
+if "raw_df" not in st.session_state:
+    st.session_state.raw_df = None
+if "last_run_params" not in st.session_state:
+    st.session_state.last_run_params = None
+if "manual_depth_mask" not in st.session_state:
+    st.session_state.manual_depth_mask = None
+if "manual_velocity_mask" not in st.session_state:
+    st.session_state.manual_velocity_mask = None
 
 if uploaded_file is None:
     st.info("Upload a CSV file to begin.")
@@ -1566,6 +1608,23 @@ else:
 
             st.session_state.df_clean = df_clean
             st.session_state.pipe_diam_m = pipe_diam_m
+            st.session_state.raw_df = raw_df.copy()
+            st.session_state.manual_depth_mask = None
+            st.session_state.manual_velocity_mask = None
+            st.session_state.last_run_params = {
+                "pipe_diam_m": pipe_diam_m,
+                "flatline_run": int(flatline_run),
+                "spike_window": int(spike_window),
+                "spike_k": float(spike_k),
+                "diurnal_freq": diurnal_freq,
+                "diurnal_min_samples": int(diurnal_min_samples),
+                "depth_min_meas": depth_min_meas,
+                "depth_max_meas": depth_max_meas,
+                "vel_min_meas": vel_min_meas,
+                "vel_max_meas": vel_max_meas,
+                "froude_max": float(froude_max),
+                "gradient_k": float(gradient_k),
+            }
 
         except Exception as e:
             st.error(f"Error processing file: {e}")
@@ -1668,6 +1727,95 @@ if st.session_state.df_clean is not None:
             )
     else:
         st.markdown("_Cleaned depth–velocity relationship: not enough data to compute._")
+
+    st.subheader("Manual Good/Bad Selection for Interpolation")
+    st.markdown(
+        "Mark the samples you trust as hydraulically sound. Only these rows will seed "
+        "rating-curve and diurnal infill on the next rebuild, while unchecked rows are "
+        "treated as bad and will be regenerated."
+    )
+
+    qc_depth_reference = (
+        df_clean["depth_flag_auto"]
+        if "depth_flag_auto" in df_clean.columns
+        else df_clean["depth_flag"]
+    )
+    qc_velocity_reference = (
+        df_clean["velocity_flag_auto"]
+        if "velocity_flag_auto" in df_clean.columns
+        else df_clean["velocity_flag"]
+    )
+
+    if isinstance(st.session_state.manual_depth_mask, pd.Series) and len(st.session_state.manual_depth_mask) == len(df_clean):
+        manual_depth_defaults = st.session_state.manual_depth_mask.reindex(df_clean.index).fillna(df_clean["depth_flag"]).astype(bool)
+    else:
+        manual_depth_defaults = df_clean["depth_flag"].astype(bool)
+
+    if isinstance(st.session_state.manual_velocity_mask, pd.Series) and len(st.session_state.manual_velocity_mask) == len(df_clean):
+        manual_velocity_defaults = st.session_state.manual_velocity_mask.reindex(df_clean.index).fillna(df_clean["velocity_flag"]).astype(bool)
+    else:
+        manual_velocity_defaults = df_clean["velocity_flag"].astype(bool)
+
+    manual_selector_source = pd.DataFrame(
+        {
+            "timestamp": df_clean["timestamp"],
+            "depth": df_clean["depth"],
+            "velocity": df_clean["velocity"],
+            "qc_depth_flag": qc_depth_reference.astype(bool),
+            "qc_velocity_flag": qc_velocity_reference.astype(bool),
+            "manual_depth_good": manual_depth_defaults,
+            "manual_velocity_good": manual_velocity_defaults,
+        }
+    )
+
+    manual_selector_editor = st.data_editor(
+        manual_selector_source,
+        num_rows="fixed",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "timestamp": st.column_config.DatetimeColumn("Timestamp", disabled=True),
+            "depth": st.column_config.NumberColumn("Depth (m)", disabled=True, format="%.3f"),
+            "velocity": st.column_config.NumberColumn("Velocity (m/s)", disabled=True, format="%.3f"),
+            "qc_depth_flag": st.column_config.CheckboxColumn("QC depth good", disabled=True),
+            "qc_velocity_flag": st.column_config.CheckboxColumn("QC velocity good", disabled=True),
+            "manual_depth_good": st.column_config.CheckboxColumn("Manual depth good"),
+            "manual_velocity_good": st.column_config.CheckboxColumn("Manual velocity good"),
+        },
+        key="manual_selector_editor",
+    )
+
+    if st.button("Rebuild using manual selections", type="primary"):
+        if st.session_state.raw_df is None or st.session_state.last_run_params is None:
+            st.warning("Load a dataset and run analysis before applying manual selections.")
+        else:
+            try:
+                manual_depth_mask = pd.Series(
+                    manual_selector_editor["manual_depth_good"].astype(bool).values,
+                    index=st.session_state.raw_df.index,
+                    name="manual_depth_good",
+                )
+                manual_velocity_mask = pd.Series(
+                    manual_selector_editor["manual_velocity_good"].astype(bool).values,
+                    index=st.session_state.raw_df.index,
+                    name="manual_velocity_good",
+                )
+
+                new_df_clean, _ = process_dataset(
+                    st.session_state.raw_df.copy(),
+                    manual_depth_mask=manual_depth_mask,
+                    manual_velocity_mask=manual_velocity_mask,
+                    **st.session_state.last_run_params,
+                )
+
+                st.session_state.df_clean = new_df_clean
+                st.session_state.manual_depth_mask = manual_depth_mask
+                st.session_state.manual_velocity_mask = manual_velocity_mask
+                st.success("Manual selections applied. Interpolation rebuilt using trusted samples.")
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Failed to rebuild with manual selections: {e}")
+                st.exception(e)
 
     with st.expander("Depth sources & quality breakdown"):
         st.markdown("**Depth source counts**")
