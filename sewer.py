@@ -19,10 +19,11 @@ class AnomalyTracker:
         if mask is None or code is None:
             return
         target = self._depth if field == "depth" else self._velocity
+        target_index = pd.Index(target.keys())
         if isinstance(mask, pd.Series):
-            mask_iter = mask.fillna(False)
+            mask_iter = mask.reindex(target_index).fillna(False)
         else:
-            mask_iter = pd.Series(mask, index=target.keys())
+            mask_iter = pd.Series(mask, index=target_index)
         for idx in mask_iter[mask_iter].index:
             target[idx].add(code)
 
