@@ -1851,6 +1851,61 @@ if st.session_state.df_clean is not None:
             st.success("Marked selection as bad velocity data.")
             st.rerun()
 
+    # Time-range selector on x-axis
+    st.markdown("#### Time range overrides")
+    if not df_clean["timestamp"].empty:
+        ts_min = df_clean["timestamp"].min().to_pydatetime()
+        ts_max = df_clean["timestamp"].max().to_pydatetime()
+        range_start_py, range_end_py = st.slider(
+            "Select time window",
+            min_value=ts_min,
+            max_value=ts_max,
+            value=(ts_min, ts_max),
+            format="%Y-%m-%d %H:%M",
+            key="time_range_slider",
+        )
+        range_start = pd.Timestamp(range_start_py)
+        range_end = pd.Timestamp(range_end_py)
+        if range_start > range_end:
+            range_start, range_end = range_end, range_start
+        range_mask = (df_clean["timestamp"] >= range_start) & (df_clean["timestamp"] <= range_end)
+        range_row_ids = df_clean.index[range_mask].tolist()
+        st.caption(f"{range_mask.sum()} samples within selected window.")
+
+        range_cols = st.columns(4)
+        if range_cols[0].button(
+            "Depth: mark range good",
+            disabled=not range_row_ids,
+            key="btn_range_depth_good",
+        ):
+            update_manual_mask("manual_depth_mask", base_depth_defaults, range_row_ids, True)
+            st.success("Marked range as trusted depth data.")
+            st.rerun()
+        if range_cols[1].button(
+            "Depth: mark range bad",
+            disabled=not range_row_ids,
+            key="btn_range_depth_bad",
+        ):
+            update_manual_mask("manual_depth_mask", base_depth_defaults, range_row_ids, False)
+            st.success("Marked range as bad depth data.")
+            st.rerun()
+        if range_cols[2].button(
+            "Velocity: mark range good",
+            disabled=not range_row_ids,
+            key="btn_range_vel_good",
+        ):
+            update_manual_mask("manual_velocity_mask", base_velocity_defaults, range_row_ids, True)
+            st.success("Marked range as trusted velocity data.")
+            st.rerun()
+        if range_cols[3].button(
+            "Velocity: mark range bad",
+            disabled=not range_row_ids,
+            key="btn_range_vel_bad",
+        ):
+            update_manual_mask("manual_velocity_mask", base_velocity_defaults, range_row_ids, False)
+            st.success("Marked range as bad velocity data.")
+            st.rerun()
+
     manual_selector_source = pd.DataFrame(
         {
             "timestamp": df_clean["timestamp"],
