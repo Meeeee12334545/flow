@@ -1761,53 +1761,15 @@ if st.session_state.df_clean is not None:
 
     # Graphical selection helper
     st.markdown("### Graphical selection assistant")
-    selection_metric = st.radio(
-        "Metric to flag from chart",
-        options=["Depth", "Velocity"],
-        index=0,
-        horizontal=True,
-        key="graph_selection_metric",
-    )
 
     selection_cols = ["timestamp", "depth_clean", "velocity_clean"]
     if "depth_quality" in df_clean.columns:
         selection_cols.append("depth_quality")
     if "velocity_quality" in df_clean.columns:
         selection_cols.append("velocity_quality")
+
     plot_df = df_clean[selection_cols].copy()
     plot_df["row_id"] = df_clean.index
-    y_col = "depth_clean" if selection_metric == "Depth" else "velocity_clean"
-    color_col = "depth_quality" if selection_metric == "Depth" else "velocity_quality"
-    fig_select = px.scatter(
-        plot_df,
-        x="timestamp",
-        y=y_col,
-        color=color_col if color_col in plot_df.columns else None,
-        title=f"Select {selection_metric.lower()} points (box-select / lasso)",
-        labels={y_col: f"{selection_metric} (clean)", "timestamp": "Time"},
-    )
-    fig_select.update_layout(dragmode="select")
-    fig_select.update_traces(marker=dict(size=6))
-
-    selected_points = plotly_events(
-        fig_select,
-        select_event=True,
-        override_height=420,
-        key=f"{selection_metric.lower()}_plotly_select",
-    )
-
-    selected_row_ids: List[int] = []
-    if selected_points:
-        selected_indices = [
-            pt.get("pointIndex", pt.get("pointNumber"))
-            for pt in selected_points
-            if pt.get("pointIndex", pt.get("pointNumber")) is not None
-        ]
-        if selected_indices:
-            selected_row_ids = plot_df.loc[selected_indices, "row_id"].tolist()
-            st.info(
-                f"Selected {len(selected_row_ids)} samples for {selection_metric.lower()} classification."
-            )
 
     def update_manual_mask(name: str, base: pd.Series, row_ids: List[int], value: bool):
         mask = current_manual_mask(name, base).copy()
@@ -1815,41 +1777,103 @@ if st.session_state.df_clean is not None:
             mask.loc[row_ids] = value
         st.session_state[name] = mask
 
-    select_cols = st.columns(2)
-    if selection_metric == "Depth":
-        if select_cols[0].button(
-            "Mark selection as good depth",
-            disabled=not selected_row_ids,
-            key="btn_depth_good",
-        ):
-            update_manual_mask("manual_depth_mask", base_depth_defaults, selected_row_ids, True)
-            st.success("Marked selection as trusted depth data.")
-            st.rerun()
-        if select_cols[1].button(
-            "Mark selection as bad depth",
-            disabled=not selected_row_ids,
-            key="btn_depth_bad",
-        ):
-            update_manual_mask("manual_depth_mask", base_depth_defaults, selected_row_ids, False)
-            st.success("Marked selection as bad depth data.")
-            st.rerun()
-    else:
-        if select_cols[0].button(
-            "Mark selection as good velocity",
-            disabled=not selected_row_ids,
-            key="btn_vel_good",
-        ):
-            update_manual_mask("manual_velocity_mask", base_velocity_defaults, selected_row_ids, True)
-            st.success("Marked selection as trusted velocity data.")
-            st.rerun()
-        if select_cols[1].button(
-            "Mark selection as bad velocity",
-            disabled=not selected_row_ids,
-            key="btn_vel_bad",
-        ):
-            update_manual_mask("manual_velocity_mask", base_velocity_defaults, selected_row_ids, False)
-            st.success("Marked selection as bad velocity data.")
-            st.rerun()
+    # Depth selection chart
+    st.markdown("#### Depth selection")
+    fig_depth_select = px.scatter(
+        plot_df,
+        x="timestamp",
+        y="depth_clean",
+        color="depth_quality" if "depth_quality" in plot_df.columns else None,
+        title="Highlight depth samples (box-select / lasso across plot)",
+        labels={"depth_clean": "Depth (m)", "timestamp": "Time"},
+    )
+    fig_depth_select.update_layout(dragmode="select")
+    fig_depth_select.update_traces(marker=dict(size=6))
+
+    depth_points = plotly_events(
+        fig_depth_select,
+        select_event=True,
+        override_height=360,
+        key="depth_plotly_select",
+    )
+
+    depth_row_ids: List[int] = []
+    if depth_points:
+        depth_indices = [
+            pt.get("pointIndex", pt.get("pointNumber"))
+            for pt in depth_points
+            if pt.get("pointIndex", pt.get("pointNumber")) is not None
+        ]
+        if depth_indices:
+            depth_row_ids = plot_df.iloc[depth_indices]["row_id"].tolist()
+            st.info(f"Depth chart: selected {len(depth_row_ids)} samples.")
+
+    depth_cols = st.columns(2)
+    if depth_cols[0].button(
+        "Mark depth selection as good",
+        disabled=not depth_row_ids,
+        key="btn_depth_select_good",
+    ):
+        update_manual_mask("manual_depth_mask", base_depth_defaults, depth_row_ids, True)
+        st.success("Depth selection marked as trusted.")
+        st.rerun()
+    if depth_cols[1].button(
+        "Mark depth selection as bad",
+        disabled=not depth_row_ids,
+        key="btn_depth_select_bad",
+    ):
+        update_manual_mask("manual_depth_mask", base_depth_defaults, depth_row_ids, False)
+        st.success("Depth selection marked as bad.")
+        st.rerun()
+
+    # Velocity selection chart
+    st.markdown("#### Velocity selection")
+    fig_vel_select = px.scatter(
+        plot_df,
+        x="timestamp",
+        y="velocity_clean",
+        color="velocity_quality" if "velocity_quality" in plot_df.columns else None,
+        title="Highlight velocity samples (box-select / lasso across plot)",
+        labels={"velocity_clean": "Velocity (m/s)", "timestamp": "Time"},
+    )
+    fig_vel_select.update_layout(dragmode="select")
+    fig_vel_select.update_traces(marker=dict(size=6))
+
+    velocity_points = plotly_events(
+        fig_vel_select,
+        select_event=True,
+        override_height=360,
+        key="velocity_plotly_select",
+    )
+
+    velocity_row_ids: List[int] = []
+    if velocity_points:
+        velocity_indices = [
+            pt.get("pointIndex", pt.get("pointNumber"))
+            for pt in velocity_points
+            if pt.get("pointIndex", pt.get("pointNumber")) is not None
+        ]
+        if velocity_indices:
+            velocity_row_ids = plot_df.iloc[velocity_indices]["row_id"].tolist()
+            st.info(f"Velocity chart: selected {len(velocity_row_ids)} samples.")
+
+    velocity_cols = st.columns(2)
+    if velocity_cols[0].button(
+        "Mark velocity selection as good",
+        disabled=not velocity_row_ids,
+        key="btn_vel_select_good",
+    ):
+        update_manual_mask("manual_velocity_mask", base_velocity_defaults, velocity_row_ids, True)
+        st.success("Velocity selection marked as trusted.")
+        st.rerun()
+    if velocity_cols[1].button(
+        "Mark velocity selection as bad",
+        disabled=not velocity_row_ids,
+        key="btn_vel_select_bad",
+    ):
+        update_manual_mask("manual_velocity_mask", base_velocity_defaults, velocity_row_ids, False)
+        st.success("Velocity selection marked as bad.")
+        st.rerun()
 
     # Time-range selector on x-axis
     st.markdown("#### Time range overrides")
