@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from streamlit_plotly_events import plotly_events
 
 
 class AnomalyTracker:
@@ -1746,15 +1747,109 @@ if st.session_state.df_clean is not None:
         else df_clean["velocity_flag"]
     )
 
-    if isinstance(st.session_state.manual_depth_mask, pd.Series) and len(st.session_state.manual_depth_mask) == len(df_clean):
-        manual_depth_defaults = st.session_state.manual_depth_mask.reindex(df_clean.index).fillna(df_clean["depth_flag"]).astype(bool)
-    else:
-        manual_depth_defaults = df_clean["depth_flag"].astype(bool)
+    base_depth_defaults = df_clean["depth_flag"].astype(bool)
+    base_velocity_defaults = df_clean["velocity_flag"].astype(bool)
 
-    if isinstance(st.session_state.manual_velocity_mask, pd.Series) and len(st.session_state.manual_velocity_mask) == len(df_clean):
-        manual_velocity_defaults = st.session_state.manual_velocity_mask.reindex(df_clean.index).fillna(df_clean["velocity_flag"]).astype(bool)
+    def current_manual_mask(name: str, base: pd.Series) -> pd.Series:
+        mask = st.session_state.get(name)
+        if isinstance(mask, pd.Series) and len(mask) == len(base):
+            return mask.reindex(base.index).fillna(base).astype(bool)
+        return base.astype(bool)
+
+    manual_depth_defaults = current_manual_mask("manual_depth_mask", base_depth_defaults)
+    manual_velocity_defaults = current_manual_mask("manual_velocity_mask", base_velocity_defaults)
+
+    # Graphical selection helper
+    st.markdown("### Graphical selection assistant")
+    selection_metric = st.radio(
+        "Metric to flag from chart",
+        options=["Depth", "Velocity"],
+        index=0,
+        horizontal=True,
+        key="graph_selection_metric",
+    )
+
+    selection_cols = ["timestamp", "depth_clean", "velocity_clean"]
+    if "depth_quality" in df_clean.columns:
+        selection_cols.append("depth_quality")
+    if "velocity_quality" in df_clean.columns:
+        selection_cols.append("velocity_quality")
+    plot_df = df_clean[selection_cols].copy()
+    plot_df["row_id"] = df_clean.index
+    y_col = "depth_clean" if selection_metric == "Depth" else "velocity_clean"
+    color_col = "depth_quality" if selection_metric == "Depth" else "velocity_quality"
+    fig_select = px.scatter(
+        plot_df,
+        x="timestamp",
+        y=y_col,
+        color=color_col if color_col in plot_df.columns else None,
+        title=f"Select {selection_metric.lower()} points (box-select / lasso)",
+        labels={y_col: f"{selection_metric} (clean)", "timestamp": "Time"},
+    )
+    fig_select.update_layout(dragmode="select")
+    fig_select.update_traces(marker=dict(size=6))
+
+    selected_points = plotly_events(
+        fig_select,
+        select_event=True,
+        override_height=420,
+        key=f"{selection_metric.lower()}_plotly_select",
+    )
+
+    selected_row_ids: List[int] = []
+    if selected_points:
+        selected_indices = [
+            pt.get("pointIndex", pt.get("pointNumber"))
+            for pt in selected_points
+            if pt.get("pointIndex", pt.get("pointNumber")) is not None
+        ]
+        if selected_indices:
+            selected_row_ids = plot_df.loc[selected_indices, "row_id"].tolist()
+            st.info(
+                f"Selected {len(selected_row_ids)} samples for {selection_metric.lower()} classification."
+            )
+
+    def update_manual_mask(name: str, base: pd.Series, row_ids: List[int], value: bool):
+        mask = current_manual_mask(name, base).copy()
+        if row_ids:
+            mask.loc[row_ids] = value
+        st.session_state[name] = mask
+
+    select_cols = st.columns(2)
+    if selection_metric == "Depth":
+        if select_cols[0].button(
+            "Mark selection as good depth",
+            disabled=not selected_row_ids,
+            key="btn_depth_good",
+        ):
+            update_manual_mask("manual_depth_mask", base_depth_defaults, selected_row_ids, True)
+            st.success("Marked selection as trusted depth data.")
+            st.rerun()
+        if select_cols[1].button(
+            "Mark selection as bad depth",
+            disabled=not selected_row_ids,
+            key="btn_depth_bad",
+        ):
+            update_manual_mask("manual_depth_mask", base_depth_defaults, selected_row_ids, False)
+            st.success("Marked selection as bad depth data.")
+            st.rerun()
     else:
-        manual_velocity_defaults = df_clean["velocity_flag"].astype(bool)
+        if select_cols[0].button(
+            "Mark selection as good velocity",
+            disabled=not selected_row_ids,
+            key="btn_vel_good",
+        ):
+            update_manual_mask("manual_velocity_mask", base_velocity_defaults, selected_row_ids, True)
+            st.success("Marked selection as trusted velocity data.")
+            st.rerun()
+        if select_cols[1].button(
+            "Mark selection as bad velocity",
+            disabled=not selected_row_ids,
+            key="btn_vel_bad",
+        ):
+            update_manual_mask("manual_velocity_mask", base_velocity_defaults, selected_row_ids, False)
+            st.success("Marked selection as bad velocity data.")
+            st.rerun()
 
     manual_selector_source = pd.DataFrame(
         {
@@ -1812,7 +1907,7 @@ if st.session_state.df_clean is not None:
                 st.session_state.manual_depth_mask = manual_depth_mask
                 st.session_state.manual_velocity_mask = manual_velocity_mask
                 st.success("Manual selections applied. Interpolation rebuilt using trusted samples.")
-                st.experimental_rerun()
+                st.rerun()
             except Exception as e:
                 st.error(f"Failed to rebuild with manual selections: {e}")
                 st.exception(e)
