@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import io
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -80,6 +80,193 @@ def robust_spike_mask(series: pd.Series, window: int = 7, k: float = 6.0) -> pd.
     return spike_mask
 
 
+def detect_gradient_anomalies(
+    timestamps: pd.Series,
+    series: pd.Series,
+    k: float = 8.0,
+    window: int = 5,
+) -> pd.Series:
+    """Flag points where rate of change deviates strongly from typical behaviour."""
+    if series.isna().all() or len(series) < 5:
+        return pd.Series(False, index=series.index)
+
+    time_diff = timestamps.diff().dt.total_seconds().replace(0, np.nan)
+    gradient = series.diff() / time_diff
+    gradient = gradient.rolling(window=window, center=True, min_periods=2).median()
+
+    grad_med = gradient.median()
+    grad_mad = (gradient - grad_med).abs().median()
+    if grad_mad and grad_mad > 0:
+        z = (gradient - grad_med).abs() / (grad_mad / 0.6745)
+    else:
+        std = gradient.std()
+        if std and std > 0:
+            z = (gradient - grad_med).abs() / std
+        else:
+            return pd.Series(False, index=series.index)
+
+    mask = z > k
+    mask = mask.reindex(series.index, fill_value=False)
+    return mask.fillna(False)
+
+
+def compute_froude_number(depth: pd.Series, velocity: pd.Series) -> pd.Series:
+    """Compute Froude number for each observation with safety for low depth."""
+    g = 9.80665
+    depth_eff = depth.clip(lower=1e-4)
+    velo_eff = velocity.clip(lower=0.0)
+    froude = velo_eff / np.sqrt(g * depth_eff)
+    froude[depth.isna() | velocity.isna()] = np.nan
+    return froude
+
+
+def detect_froude_anomalies(
+    depth: pd.Series,
+    velocity: pd.Series,
+    froude_max: float,
+    froude_min: float = 0.0,
+) -> pd.Series:
+    """Flag velocities that imply implausible Froude numbers."""
+    froude = compute_froude_number(depth, velocity)
+    mask_high = froude > froude_max
+    mask_low = froude < froude_min
+    mask = (mask_high | mask_low).fillna(False)
+    return mask
+
+
+def _compute_pchip_slopes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Compute monotone cubic slopes using the Fritsch-Carlson method."""
+    n = len(x)
+    h = np.diff(x)
+    delta = np.diff(y) / h
+
+    slopes = np.zeros_like(y)
+
+    def _edge_slope(delta0, delta1, h0, h1):
+        m = ((2 * h0 + h1) * delta0 - h0 * delta1) / (h0 + h1)
+        if m * delta0 <= 0:
+            return 0.0
+        if delta0 * delta1 < 0 and abs(m) > 2 * abs(delta0):
+            return 2 * delta0
+        return m
+
+    if n == 2:
+        slopes[:] = delta[0]
+        return slopes
+
+    slopes[0] = _edge_slope(delta[0], delta[1], h[0], h[1])
+    slopes[-1] = _edge_slope(delta[-1], delta[-2], h[-1], h[-2])
+
+    for i in range(1, n - 1):
+        if delta[i - 1] * delta[i] <= 0:
+            slopes[i] = 0.0
+        else:
+            w1 = 2 * h[i] + h[i - 1]
+            w2 = h[i] + 2 * h[i - 1]
+            slopes[i] = (w1 + w2) / (w1 / delta[i - 1] + w2 / delta[i])
+
+    return slopes
+
+
+def _pchip_eval(
+    x: np.ndarray,
+    y: np.ndarray,
+    slopes: np.ndarray,
+    x_new: np.ndarray,
+) -> np.ndarray:
+    """Evaluate monotone cubic Hermite spline at new x values."""
+    x_new = np.asarray(x_new, dtype=float)
+    result = np.empty_like(x_new)
+
+    for idx, xi in enumerate(x_new):
+        if xi <= x[0]:
+            result[idx] = y[0] + (xi - x[0]) * slopes[0]
+            continue
+        if xi >= x[-1]:
+            result[idx] = y[-1] + (xi - x[-1]) * slopes[-1]
+            continue
+
+        j = np.searchsorted(x, xi) - 1
+        j = np.clip(j, 0, len(x) - 2)
+        h = x[j + 1] - x[j]
+        t = (xi - x[j]) / h
+
+        h00 = (2 * t ** 3) - (3 * t ** 2) + 1
+        h10 = t ** 3 - 2 * t ** 2 + t
+        h01 = -2 * t ** 3 + 3 * t ** 2
+        h11 = t ** 3 - t ** 2
+
+        result[idx] = (
+            h00 * y[j]
+            + h10 * h * slopes[j]
+            + h01 * y[j + 1]
+            + h11 * h * slopes[j + 1]
+        )
+
+    return result
+
+
+def make_monotone_cubic_interpolator(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Return callable monotone cubic interpolator for (x, y) data."""
+    order = np.argsort(x)
+    x_ord = np.asarray(x, dtype=float)[order]
+    y_ord = np.asarray(y, dtype=float)[order]
+
+    unique_mask = np.concatenate(([True], np.diff(x_ord) > 0))
+    x_unique = x_ord[unique_mask]
+    y_unique = y_ord[unique_mask]
+
+    if len(x_unique) < 2:
+        def _flat(_x_new):
+            return np.full_like(np.asarray(_x_new, dtype=float), y_unique[0])
+
+        return _flat
+
+    slopes = _compute_pchip_slopes(x_unique, y_unique)
+
+    def _interp(x_new: np.ndarray) -> np.ndarray:
+        return _pchip_eval(x_unique, y_unique, slopes, np.asarray(x_new, dtype=float))
+
+    return _interp
+
+
+def monotone_time_fill(series: pd.Series) -> pd.Series:
+    """Fill missing values using monotone cubic interpolation over time."""
+    if series.isna().sum() == 0:
+        return series
+
+    mask = series.notna()
+    if mask.sum() < 4:
+        return series
+
+    x = series.index.view(np.int64) / 1e9
+    x_known = x[mask]
+    y_known = series[mask].astype(float).values
+
+    unique, idx = np.unique(x_known, return_index=True)
+    x_known = x_known[idx]
+    y_known = y_known[idx]
+
+    if len(x_known) < 4:
+        return series
+
+    interpolator = make_monotone_cubic_interpolator(x_known, y_known)
+
+    missing_idx = np.where(~mask)[0]
+    if len(missing_idx) == 0:
+        return series
+
+    x_missing = x[~mask]
+    y_missing = interpolator(x_missing)
+
+    filled = series.copy()
+    filled.iloc[missing_idx] = y_missing
+    return filled
+
+
 def long_true_runs(mask: pd.Series, min_run: int) -> pd.Series:
     """
     Given a boolean Series, return True where there are contiguous runs
@@ -139,32 +326,22 @@ def build_rating_curve(
     depth_knots = depth_knots[order]
     vel_knots = vel_knots[order]
 
-    # Enforce non-negative, non-decreasing velocity with depth
+    # Enforce non-negative, non-decreasing velocity with depth and smooth
     vel_knots = np.maximum(vel_knots, 0.0)
     vel_knots = np.maximum.accumulate(vel_knots)
 
+    v_interp = make_monotone_cubic_interpolator(depth_knots, vel_knots)
+    d_interp = make_monotone_cubic_interpolator(vel_knots, depth_knots)
+
     def v_expected(d):
-        d = np.asarray(d, dtype=float)
-        return np.interp(
-            d,
-            depth_knots,
-            vel_knots,
-            left=0.0,
-            right=vel_knots[-1],
-        )
+        d_arr = np.asarray(d, dtype=float)
+        v_vals = v_interp(d_arr)
+        return np.clip(v_vals, a_min=0.0, a_max=None)
 
     def d_expected(v):
-        v = np.asarray(v, dtype=float)
-        v_knots = vel_knots.copy()
-        if np.allclose(v_knots, 0.0):
-            return np.interp(v, [0.0, 1.0], [depth_knots[0], depth_knots[-1]])
-        return np.interp(
-            v,
-            v_knots,
-            depth_knots,
-            left=depth_knots[0],
-            right=depth_knots[-1],
-        )
+        v_arr = np.asarray(v, dtype=float)
+        d_vals = d_interp(v_arr)
+        return np.clip(d_vals, a_min=depth_knots[0], a_max=depth_knots[-1])
 
     return depth_knots, vel_knots, v_expected, d_expected
 
@@ -272,6 +449,8 @@ def apply_quality_checks(
     depth_max_meas: Optional[float] = None,
     vel_min_meas: Optional[float] = None,
     vel_max_meas: Optional[float] = None,
+    froude_max: float = 1.5,
+    gradient_k: float = 8.0,
 ):
     """
     Add depth_flag and velocity_flag columns (True = good).
@@ -285,6 +464,7 @@ def apply_quality_checks(
     """
     depth = df["depth"]
     vel = df["velocity"]
+    timestamps = df["timestamp"]
 
     depth_flag = pd.Series(True, index=df.index)
     vel_flag = pd.Series(True, index=df.index)
@@ -346,6 +526,17 @@ def apply_quality_checks(
     depth_flag &= ~depth_spike
     vel_flag &= ~vel_spike
 
+    # Rapid gradient anomalies (sudden jumps inconsistent with sampling)
+    depth_grad = detect_gradient_anomalies(timestamps, depth, k=gradient_k)
+    vel_grad = detect_gradient_anomalies(timestamps, vel, k=gradient_k)
+    depth_flag &= ~depth_grad
+    vel_flag &= ~vel_grad
+
+    # Froude-based hydraulic plausibility
+    if froude_max is not None and froude_max > 0:
+        froude_bad = detect_froude_anomalies(depth, vel, froude_max=froude_max)
+        vel_flag &= ~froude_bad
+
     # Rating curve consistency: depth is generally trusted, so we only
     # use the curve to mark velocity outliers here.
     combined_good = depth_flag & vel_flag
@@ -364,7 +555,17 @@ def apply_quality_checks(
             curve_outliers_v = z_v > 4.0
             vel_flag &= ~curve_outliers_v
 
-        # We *don't* mark depth bad from curve consistency; depth is the anchor.
+        # Depth consistency check where velocity is reliable
+        if d_expected is not None:
+            d_pred = pd.Series(d_expected(np.clip(vel, a_min=0.0, a_max=None)), index=df.index)
+            d_resid = depth - d_pred
+            d_resid_good = d_resid[combined_good]
+            mad_d = d_resid_good.abs().median()
+            scale_d = mad_d / 0.6745 if mad_d > 0 else d_resid_good.std()
+            if scale_d and scale_d > 0:
+                z_d = (d_resid.abs() / scale_d)
+                curve_outliers_d = z_d > 4.5
+                depth_flag &= ~curve_outliers_d
 
     # Diurnal baseline anomalies
     depth_flag, vel_flag = detect_diurnal_baseline_anomalies(
@@ -476,10 +677,11 @@ def interpolate_signals(
     vel_max_meas: Optional[float] = None,
 ) -> pd.DataFrame:
     """
-    Build depth_clean / velocity_clean using, in order:
-      1) rating curve infill (physics-based, **depth→velocity especially**)
-      2) diurnal (time-of-day) median profiles across good days
-      3) time interpolation as a final step
+        Build depth_clean / velocity_clean using, in order:
+            1) rating curve infill (physics-based, **depth→velocity especially**)
+            2) diurnal (time-of-day) median profiles across good days
+            3) monotone Hermite interpolation to conserve hydraulic shape
+            4) time interpolation as a fallback
 
     Measured min/max depth & velocity (if provided) are enforced at the end,
     and a global minimum of 0.01 m/s is applied to velocity_clean.
@@ -532,22 +734,47 @@ def interpolate_signals(
         diurnal_freq=diurnal_freq,
     )
 
-    # 3) Time interpolation
+    # 3) Hydraulic shape-preserving interpolation (monotone cubic)
     df = df.set_index("timestamp")
 
     depth_before = df["depth_clean"].copy()
-    df["depth_clean"] = df["depth_clean"].interpolate(method="time", limit_direction="both")
-    filled_depth = depth_before.isna() & df["depth_clean"].notna()
-    df.loc[filled_depth & (df["depth_source"] == "bad"), "depth_source"] = "time_interp"
+    depth_monotone = monotone_time_fill(df["depth_clean"])
+    depth_monotone_mask = depth_before.isna() & depth_monotone.notna()
+    df.loc[depth_monotone_mask, "depth_clean"] = depth_monotone[depth_monotone_mask]
+    df.loc[
+        depth_monotone_mask & (df["depth_source"] == "bad"),
+        "depth_source",
+    ] = "monotone_interp"
 
     vel_before = df["velocity_clean"].copy()
+    vel_monotone = monotone_time_fill(df["velocity_clean"])
+    vel_monotone_mask = vel_before.isna() & vel_monotone.notna()
+    df.loc[vel_monotone_mask, "velocity_clean"] = vel_monotone[vel_monotone_mask]
+    df.loc[
+        vel_monotone_mask & (df["velocity_source"] == "bad"),
+        "velocity_source",
+    ] = "monotone_interp"
+
+    # 4) Time interpolation fallback
+    depth_before_time = df["depth_clean"].copy()
+    df["depth_clean"] = df["depth_clean"].interpolate(method="time", limit_direction="both")
+    filled_depth_time = depth_before_time.isna() & df["depth_clean"].notna()
+    df.loc[
+        filled_depth_time & (df["depth_source"] == "bad"),
+        "depth_source",
+    ] = "time_interp"
+
+    vel_before_time = df["velocity_clean"].copy()
     df["velocity_clean"] = df["velocity_clean"].interpolate(method="time", limit_direction="both")
-    filled_vel = vel_before.isna() & df["velocity_clean"].notna()
-    df.loc[filled_vel & (df["velocity_source"] == "bad"), "velocity_source"] = "time_interp"
+    filled_vel_time = vel_before_time.isna() & df["velocity_clean"].notna()
+    df.loc[
+        filled_vel_time & (df["velocity_source"] == "bad"),
+        "velocity_source",
+    ] = "time_interp"
 
     df = df.reset_index()
 
-    # 4) Enforce measured & global bounds on final cleaned series
+    # 5) Enforce measured & global bounds on final cleaned series
     # Depth
     df["depth_clean"] = df["depth_clean"].clip(
         lower=depth_min_meas,
@@ -620,6 +847,9 @@ def assign_quality_labels(df: pd.DataFrame) -> pd.DataFrame:
     is_time_d = df["depth_source"] == "time_interp"
     depth_quality[is_time_d] = "inferred_time"
 
+    is_shape_d = df["depth_source"] == "monotone_interp"
+    depth_quality[is_shape_d] = "inferred_shape"
+
     df["depth_quality"] = depth_quality
 
     # Velocity quality
@@ -642,6 +872,9 @@ def assign_quality_labels(df: pd.DataFrame) -> pd.DataFrame:
 
     is_time_v = df["velocity_source"] == "time_interp"
     velocity_quality[is_time_v] = "inferred_time"
+
+    is_shape_v = df["velocity_source"] == "monotone_interp"
+    velocity_quality[is_shape_v] = "inferred_shape"
 
     df["velocity_quality"] = velocity_quality
 
@@ -727,6 +960,17 @@ def qc_stats(df: pd.DataFrame, pipe_diam_m: Optional[float]):
                 "mean_lps": float(good_flow.mean()),
                 "p95_lps": float(good_flow.quantile(0.95)),
             }
+
+    if "depth_clean" in df.columns and "velocity_clean" in df.columns:
+        froude = compute_froude_number(df["depth_clean"], df["velocity_clean"])
+        froude = froude.dropna()
+        if not froude.empty:
+            stats["froude_stats"] = {
+                "min": float(froude.min()),
+                "median": float(froude.median()),
+                "p95": float(froude.quantile(0.95)),
+                "max": float(froude.max()),
+            }
     return stats
 
 
@@ -742,6 +986,8 @@ def process_dataset(
     depth_max_meas: Optional[float],
     vel_min_meas: Optional[float],
     vel_max_meas: Optional[float],
+    froude_max: float,
+    gradient_k: float,
 ):
     d_knots, v_knots, v_expected, d_expected = apply_quality_checks(
         df,
@@ -755,6 +1001,8 @@ def process_dataset(
         depth_max_meas=depth_max_meas,
         vel_min_meas=vel_min_meas,
         vel_max_meas=vel_max_meas,
+        froude_max=froude_max,
+        gradient_k=gradient_k,
     )
 
     if v_expected is None or d_expected is None:
@@ -800,6 +1048,8 @@ This app applies:
 - Hydrometric-style QC: flatlines, spikes (MAD), physical & measured limits,
   rating-curve consistency (biasing blame to velocity), diurnal baseline checks.
 - Multi-layer infill: depth-driven rating curve → diurnal profiles → time interpolation.
+- Hydraulic integrity checks: Froude screening, gradient outlier detection, and
+    shape-preserving monotone interpolation for high-fidelity infill.
 - Optional open-channel flow calculation **Q = A × V** for circular pipes.
 - Clear visibility of **good vs bad vs inferred** data,
   including depth–velocity scatter plots.
@@ -841,6 +1091,22 @@ with st.sidebar:
         value=6.0,
         step=0.5,
         help="Higher = less sensitive to spikes",
+    )
+
+    froude_max = st.number_input(
+        "Max Froude number",
+        min_value=0.5,
+        value=1.5,
+        step=0.1,
+        help="Flag velocity when V/sqrt(g*depth) exceeds this limit.",
+    )
+
+    gradient_k = st.number_input(
+        "Gradient anomaly z-threshold",
+        min_value=3.0,
+        value=8.0,
+        step=0.5,
+        help="Higher = less sensitive to sudden jumps between samples.",
     )
 
     st.markdown("---")
@@ -939,6 +1205,8 @@ else:
                 depth_max_meas=depth_max_meas,
                 vel_min_meas=vel_min_meas,
                 vel_max_meas=vel_max_meas,
+                froude_max=float(froude_max),
+                gradient_k=float(gradient_k),
             )
 
             st.session_state.df_clean = df_clean
@@ -1001,6 +1269,18 @@ if st.session_state.df_clean is not None:
         )
     )
 
+    if "froude_stats" in stats:
+        fr = stats["froude_stats"]
+        st.markdown(
+            f"""
+**Froude number (cleaned data)**
+- Min: **{fr["min"]:.3f}**
+- Median: **{fr["median"]:.3f}**
+- 95th percentile: **{fr["p95"]:.3f}**
+- Max: **{fr["max"]:.3f}**
+"""
+        )
+
     # Depth–velocity relationship summary (raw vs cleaned)
     st.markdown("### Depth–Velocity Relationship (raw vs cleaned)")
 
@@ -1045,6 +1325,9 @@ if st.session_state.df_clean is not None:
         st.json(stats["velocity_source_counts"])
         st.markdown("**Velocity quality classes**")
         st.json(stats["velocity_quality_counts"])
+        if "froude_stats" in stats:
+            st.markdown("**Froude number distribution (cleaned)**")
+            st.json(stats["froude_stats"])
         if "flow_stats" in stats:
             st.markdown("**Flow (L/s) statistics**")
             st.json(stats["flow_stats"])
