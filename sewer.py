@@ -1775,9 +1775,23 @@ if st.session_state.df_clean is not None:
     if "velocity_quality" in df_clean.columns:
         selection_cols.append("velocity_quality")
 
+    # Manual status labels for coloring
+    depth_manual_mask = st.session_state.get("manual_depth_mask")
+    velocity_manual_mask = st.session_state.get("manual_velocity_mask")
+    depth_status = pd.Series("unmarked", index=df_clean.index)
+    velocity_status = pd.Series("unmarked", index=df_clean.index)
+    if isinstance(depth_manual_mask, pd.Series) and len(depth_manual_mask) == len(df_clean):
+        depth_status = depth_manual_mask.reindex(df_clean.index)
+        depth_status = depth_status.map({True: "manual_good", False: "manual_bad"}).fillna("unmarked")
+    if isinstance(velocity_manual_mask, pd.Series) and len(velocity_manual_mask) == len(df_clean):
+        velocity_status = velocity_manual_mask.reindex(df_clean.index)
+        velocity_status = velocity_status.map({True: "manual_good", False: "manual_bad"}).fillna("unmarked")
+
     plot_df = df_clean[selection_cols].copy()
     plot_df["row_id"] = df_clean.index
     plot_df["order_idx"] = np.arange(len(plot_df))
+    plot_df["depth_status"] = depth_status.values
+    plot_df["velocity_status"] = velocity_status.values
 
     def update_manual_mask(name: str, base: pd.Series, row_ids: List[int], value: bool):
         mask = current_manual_mask(name, base).copy()
@@ -1788,6 +1802,8 @@ if st.session_state.df_clean is not None:
     def category_colors(series: pd.Series, palette=None) -> pd.Series:
         if palette is None:
             palette = {
+                "manual_good": "#2ca02c",
+                "manual_bad": "#d62728",
                 "good_raw": "#1f77b4",
                 "inferred_rating": "#2ca02c",
                 "inferred_diurnal": "#ff7f0e",
@@ -1795,10 +1811,18 @@ if st.session_state.df_clean is not None:
                 "inferred_time": "#8c564b",
                 "raw_bad": "#d62728",
                 "missing": "#7f7f7f",
+                "unmarked": "#7f7f7f",
             }
         return series.map(palette).fillna("#7f7f7f")
 
-    def make_selection_chart(y_raw: str, y_clean: str, quality_col: Optional[str], title: str, y_label: str):
+    def make_selection_chart(
+        y_raw: str,
+        y_clean: str,
+        quality_col: Optional[str],
+        status_col: Optional[str],
+        title: str,
+        y_label: str,
+    ):
         fig = go.Figure()
         fig.add_trace(
             go.Scatter(
@@ -1820,7 +1844,10 @@ if st.session_state.df_clean is not None:
         )
         marker_colors = None
         marker_text = None
-        if quality_col and quality_col in plot_df.columns:
+        if status_col and status_col in plot_df.columns:
+            marker_colors = category_colors(plot_df[status_col])
+            marker_text = plot_df[status_col].astype(str)
+        elif quality_col and quality_col in plot_df.columns:
             marker_colors = category_colors(plot_df[quality_col])
             marker_text = plot_df[quality_col].astype(str)
         fig.add_trace(
@@ -1864,6 +1891,7 @@ if st.session_state.df_clean is not None:
         y_raw="depth",
         y_clean="depth_clean",
         quality_col="depth_quality" if "depth_quality" in plot_df.columns else None,
+        status_col="depth_status",
         title="Depth over time (select to flag good/bad)",
         y_label="Depth (m)",
     )
@@ -1901,6 +1929,7 @@ if st.session_state.df_clean is not None:
         y_raw="velocity",
         y_clean="velocity_clean",
         quality_col="velocity_quality" if "velocity_quality" in plot_df.columns else None,
+        status_col="velocity_status",
         title="Velocity over time (select to flag good/bad)",
         y_label="Velocity (m/s)",
     )
