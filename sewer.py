@@ -1,11 +1,69 @@
 #!/usr/bin/env python3
 import io
-from typing import Callable, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+
+class AnomalyTracker:
+    """Track anomaly codes for depth and velocity measurements."""
+
+    def __init__(self, index: pd.Index):
+        self._depth = {idx: set() for idx in index}
+        self._velocity = {idx: set() for idx in index}
+
+    def add(self, mask: pd.Series, code: str, field: str):
+        if mask is None or code is None:
+            return
+        target = self._depth if field == "depth" else self._velocity
+        if isinstance(mask, pd.Series):
+            mask_iter = mask.fillna(False)
+        else:
+            mask_iter = pd.Series(mask, index=target.keys())
+        for idx in mask_iter[mask_iter].index:
+            target[idx].add(code)
+
+    def extend(self, indices: pd.Index, code: str, field: str):
+        target = self._depth if field == "depth" else self._velocity
+        for idx in indices:
+            if idx in target:
+                target[idx].add(code)
+
+    def series(self, field: str) -> pd.Series:
+        target = self._depth if field == "depth" else self._velocity
+        return pd.Series(
+            [";".join(sorted(codes)) if codes else "" for codes in target.values()],
+            index=pd.Index(target.keys()),
+        )
+
+    def merge_code(self, mask: pd.Series, code: str):
+        self.add(mask, code, "depth")
+        self.add(mask, code, "velocity")
+
+
+def infer_sampling_seconds(timestamps: pd.Series) -> float:
+    """Infer dominant sampling interval in seconds from a timestamp series."""
+    diffs = timestamps.sort_values().diff().dt.total_seconds().dropna()
+    if diffs.empty:
+        return 60.0
+    return float(diffs.median())
+
+
+def seconds_to_pandas_rule(seconds: float) -> str:
+    seconds = max(1.0, float(seconds))
+    if seconds < 60:
+        return f"{int(round(seconds))}S"
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return f"{int(round(minutes))}min"
+    hours = minutes / 60.0
+    if hours < 24:
+        return f"{int(round(hours))}H"
+    days = hours / 24.0
+    return f"{max(1, int(round(days)))}D"
 
 
 # =========================
@@ -54,6 +112,101 @@ def load_data_from_buffer(buffer: io.BytesIO) -> pd.DataFrame:
     df = df.dropna(subset=["timestamp"]).copy()
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df
+
+
+def load_rainfall_from_buffer(buffer: io.BytesIO) -> pd.DataFrame:
+    """Load rainfall time series (timestamp, mm) from CSV buffer."""
+    df = pd.read_csv(buffer)
+    if df.shape[1] < 2:
+        raise ValueError("Rainfall CSV must have at least timestamp and rainfall columns")
+
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    timestamp_col = None
+    rain_col = None
+    for c in df.columns:
+        if timestamp_col is None and ("time" in c or "date" in c):
+            timestamp_col = c
+        elif rain_col is None and ("rain" in c or "mm" in c or "precip" in c):
+            rain_col = c
+
+    if timestamp_col is None:
+        timestamp_col = df.columns[0]
+    if rain_col is None:
+        rain_col = df.columns[1]
+
+    df = df[[timestamp_col, rain_col]].rename(columns={timestamp_col: "timestamp", rain_col: "rainfall_mm"})
+    df["timestamp"] = pd.to_datetime(df["timestamp"], dayfirst=True, errors="coerce")
+    df["rainfall_mm"] = pd.to_numeric(df["rainfall_mm"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    return df
+
+
+def combine_rainfall_series(rainfall_frames: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Combine multiple rainfall gauges by averaging coincident timestamps."""
+    valid_frames = [f for f in rainfall_frames if f is not None and not f.empty]
+    if not valid_frames:
+        return None
+
+    combined = pd.concat(valid_frames, axis=0, ignore_index=True)
+    combined = combined.dropna(subset=["timestamp"]).copy()
+    agg = (
+        combined.groupby("timestamp")
+        ["rainfall_mm"]
+        .mean()
+        .reset_index()
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+    return agg
+
+
+def derive_weather_context(
+    flow_df: pd.DataFrame,
+    rainfall_df: Optional[pd.DataFrame],
+    rolling_window_hours: float = 6.0,
+    wet_threshold_mm: float = 0.2,
+) -> Optional[Dict[str, pd.Series]]:
+    """Derive wet/dry classification and rainfall summaries aligned to flow data."""
+    if rainfall_df is None or rainfall_df.empty:
+        return None
+
+    timestamps = flow_df["timestamp"].sort_values().reset_index(drop=False)
+    freq_seconds = infer_sampling_seconds(flow_df["timestamp"])
+    freq_rule = seconds_to_pandas_rule(freq_seconds)
+
+    rain = rainfall_df.set_index("timestamp").sort_index()
+    rain_resampled = rain["rainfall_mm"].resample(freq_rule).sum().fillna(0.0)
+
+    flow_times = timestamps["timestamp"]
+    rain_aligned = rain_resampled.reindex(flow_times, method="ffill").fillna(0.0)
+
+    window_steps = max(1, int(round((rolling_window_hours * 3600.0) / max(freq_seconds, 1.0))))
+    rain_window = rain_aligned.rolling(window=window_steps, min_periods=1).sum()
+    wet_mask = rain_window > wet_threshold_mm
+
+    is_weekend = flow_times.dt.weekday >= 5
+    condition_label = []
+    for dry, weekend in zip(~wet_mask, is_weekend):
+        if weekend and dry:
+            condition_label.append("weekend_dry")
+        elif weekend and not dry:
+            condition_label.append("weekend_wet")
+        elif (not weekend) and dry:
+            condition_label.append("weekday_dry")
+        else:
+            condition_label.append("weekday_wet")
+
+    context = {
+        "rainfall_mm": pd.Series(rain_aligned.values, index=flow_df.index),
+        "rainfall_window_mm": pd.Series(rain_window.values, index=flow_df.index),
+        "is_wet_weather": pd.Series(wet_mask.values, index=flow_df.index),
+        "is_weekend": pd.Series(is_weekend.values, index=flow_df.index),
+        "condition_label": pd.Series(condition_label, index=flow_df.index),
+    }
+    return context
 
 
 def detect_flatlines(series: pd.Series, min_run: int = 10) -> pd.Series:
@@ -451,6 +604,13 @@ def apply_quality_checks(
     vel_max_meas: Optional[float] = None,
     froude_max: float = 1.5,
     gradient_k: float = 8.0,
+    slope: Optional[float] = None,
+    roughness_n: Optional[float] = None,
+    hydraulic_tolerance: float = 0.35,
+    full_pipe_capacity_lps: Optional[float] = None,
+    capacity_tolerance: float = 0.1,
+    condition_labels: Optional[pd.Series] = None,
+    rainfall_context: Optional[Dict[str, pd.Series]] = None,
 ):
     """
     Add depth_flag and velocity_flag columns (True = good).
@@ -468,10 +628,15 @@ def apply_quality_checks(
 
     depth_flag = pd.Series(True, index=df.index)
     vel_flag = pd.Series(True, index=df.index)
+    tracker = AnomalyTracker(df.index)
 
     # NaNs
-    depth_flag &= depth.notna()
-    vel_flag &= vel.notna()
+    depth_missing = depth.isna()
+    vel_missing = vel.isna()
+    tracker.add(depth_missing, "missing_value", "depth")
+    tracker.add(vel_missing, "missing_value", "velocity")
+    depth_flag &= ~depth_missing
+    vel_flag &= ~vel_missing
 
     # Depth plausibility
     d_pos = depth[depth > 0]
@@ -482,18 +647,28 @@ def apply_quality_checks(
     else:
         depth_max_limit = np.inf
 
-    depth_flag &= depth >= 0
+    depth_negative = depth < 0
+    tracker.add(depth_negative, "plausibility_limit", "depth")
+    depth_flag &= ~depth_negative
     if pipe_diam_m is not None and pipe_diam_m > 0:
-        depth_flag &= depth <= pipe_diam_m * 1.05
+        over_full_depth = depth > pipe_diam_m * 1.05
+        tracker.add(over_full_depth, "plausibility_limit", "depth")
+        depth_flag &= ~over_full_depth
         depth_max_limit = min(depth_max_limit, pipe_diam_m * 1.05)
     else:
-        depth_flag &= depth <= depth_max_limit
+        exceed_limit = depth > depth_max_limit
+        tracker.add(exceed_limit, "plausibility_limit", "depth")
+        depth_flag &= ~exceed_limit
 
     # Measured depth limits
     if depth_min_meas is not None:
-        depth_flag &= depth >= depth_min_meas
+        below_measured = depth < depth_min_meas
+        tracker.add(below_measured, "measured_min_limit", "depth")
+        depth_flag &= ~below_measured
     if depth_max_meas is not None:
-        depth_flag &= depth <= depth_max_meas
+        above_measured = depth > depth_max_meas
+        tracker.add(above_measured, "measured_max_limit", "depth")
+        depth_flag &= ~above_measured
 
     # Velocity plausibility
     v_abs = vel.abs()[vel.notna()]
@@ -505,37 +680,81 @@ def apply_quality_checks(
         vel_max_limit = np.inf
 
     # No negative velocities allowed in QC
-    vel_flag &= vel >= 0.0
-    vel_flag &= vel.abs() <= vel_max_limit
+    non_positive_vel = vel <= 0.0
+    tracker.add(non_positive_vel, "negative_or_zero_velocity", "velocity")
+    vel_flag &= ~non_positive_vel
+
+    over_vel_limit = vel.abs() > vel_max_limit
+    tracker.add(over_vel_limit, "plausibility_limit", "velocity")
+    vel_flag &= ~over_vel_limit
 
     # Measured velocity limits
     if vel_min_meas is not None:
-        vel_flag &= vel >= vel_min_meas
+        below_vel_min = vel < vel_min_meas
+        tracker.add(below_vel_min, "measured_min_limit", "velocity")
+        vel_flag &= ~below_vel_min
     if vel_max_meas is not None:
-        vel_flag &= vel <= vel_max_meas
+        above_vel_max = vel > vel_max_meas
+        tracker.add(above_vel_max, "measured_max_limit", "velocity")
+        vel_flag &= ~above_vel_max
 
     # Flatlines
     depth_flat = detect_flatlines(depth, min_run=flatline_run)
     vel_flat = detect_flatlines(vel, min_run=flatline_run)
+    tracker.add(depth_flat, "flatline_sensor_stuck", "depth")
+    tracker.add(vel_flat, "flatline_sensor_stuck", "velocity")
     depth_flag &= ~depth_flat
     vel_flag &= ~vel_flat
 
     # Spikes
     depth_spike = robust_spike_mask(depth, window=spike_window, k=spike_k)
     vel_spike = robust_spike_mask(vel, window=spike_window, k=spike_k)
+    tracker.add(depth_spike, "spike_outlier", "depth")
+    tracker.add(vel_spike, "spike_outlier", "velocity")
     depth_flag &= ~depth_spike
     vel_flag &= ~vel_spike
 
     # Rapid gradient anomalies (sudden jumps inconsistent with sampling)
     depth_grad = detect_gradient_anomalies(timestamps, depth, k=gradient_k)
     vel_grad = detect_gradient_anomalies(timestamps, vel, k=gradient_k)
+    tracker.add(depth_grad, "gradient_outlier", "depth")
+    tracker.add(vel_grad, "gradient_outlier", "velocity")
     depth_flag &= ~depth_grad
     vel_flag &= ~vel_grad
 
     # Froude-based hydraulic plausibility
     if froude_max is not None and froude_max > 0:
         froude_bad = detect_froude_anomalies(depth, vel, froude_max=froude_max)
+        tracker.add(froude_bad, "froude_outlier", "velocity")
         vel_flag &= ~froude_bad
+
+    # Manning-based hydraulic expectation
+    hydraulic_velocity = manning_velocity(depth, pipe_diam_m, slope, roughness_n)
+    df["velocity_manning"] = hydraulic_velocity
+    if hydraulic_velocity.notna().any() and hydraulic_tolerance is not None:
+        tolerance = max(0.05, hydraulic_tolerance)
+        hydro_mask = vel.notna() & hydraulic_velocity.notna()
+        upper = hydraulic_velocity * (1 + tolerance)
+        lower = hydraulic_velocity * max(0.0, 1 - tolerance)
+        lower = lower.clip(lower=0.0)
+        hydro_high = hydro_mask & (vel > upper)
+        hydro_low = hydro_mask & (vel < lower)
+        hydro_bad = hydro_high | hydro_low
+        tracker.add(hydro_bad, "hydraulic_outlier", "velocity")
+        vel_flag &= ~hydro_bad
+
+    # Capacity check
+    capacity_lps = full_pipe_capacity_lps
+    if capacity_lps is None:
+        capacity_lps = theoretical_full_pipe_capacity_lps(pipe_diam_m, slope, roughness_n)
+
+    if capacity_lps is not None and pipe_diam_m is not None and pipe_diam_m > 0:
+        area = circular_area_from_depth(depth, pipe_diam_m)
+        flow_lps_est = area * vel * 1000.0
+        df["flow_est_lps"] = flow_lps_est
+        overload = flow_lps_est > capacity_lps * (1 + max(0.0, capacity_tolerance))
+        tracker.add(overload, "capacity_exceeded", "velocity")
+        vel_flag &= ~overload
 
     # Rating curve consistency: depth is generally trusted, so we only
     # use the curve to mark velocity outliers here.
@@ -544,20 +763,47 @@ def apply_quality_checks(
         depth, vel, combined_good
     )
 
+    cluster_curves: Dict[str, Dict[str, Callable]] = {}
+    if condition_labels is not None:
+        unique_labels = [lab for lab in condition_labels.dropna().unique()]
+        for label in unique_labels:
+            mask_cluster = combined_good & condition_labels.eq(label)
+            if mask_cluster.sum() < 10:
+                continue
+            d_k, v_k, v_fn, d_fn = build_rating_curve(depth, vel, mask_cluster)
+            if v_fn is not None and d_fn is not None:
+                cluster_curves[str(label)] = {
+                    "v": v_fn,
+                    "d": d_fn,
+                }
+
     if v_expected is not None:
         # Velocity vs expected from depth
         v_pred = pd.Series(v_expected(depth), index=df.index)
+        if cluster_curves and condition_labels is not None:
+            for label, funcs in cluster_curves.items():
+                mask_label = condition_labels.astype(str) == label
+                if mask_label.any():
+                    v_pred.loc[mask_label] = funcs["v"](depth[mask_label])
         v_resid = vel - v_pred
         mad = v_resid.abs().median()
         scale = mad / 0.6745 if mad > 0 else v_resid.std()
         if scale and scale > 0:
             z_v = (v_resid.abs() / scale)
             curve_outliers_v = z_v > 4.0
+            tracker.add(curve_outliers_v, "rating_curve_mismatch", "velocity")
             vel_flag &= ~curve_outliers_v
 
         # Depth consistency check where velocity is reliable
         if d_expected is not None:
             d_pred = pd.Series(d_expected(np.clip(vel, a_min=0.0, a_max=None)), index=df.index)
+            if cluster_curves and condition_labels is not None:
+                for label, funcs in cluster_curves.items():
+                    mask_label = condition_labels.astype(str) == label
+                    if mask_label.any():
+                        d_pred.loc[mask_label] = funcs["d"](
+                            np.clip(vel[mask_label], a_min=0.0, a_max=None)
+                        )
             d_resid = depth - d_pred
             d_resid_good = d_resid[combined_good]
             mad_d = d_resid_good.abs().median()
@@ -565,9 +811,12 @@ def apply_quality_checks(
             if scale_d and scale_d > 0:
                 z_d = (d_resid.abs() / scale_d)
                 curve_outliers_d = z_d > 4.5
+                tracker.add(curve_outliers_d, "rating_curve_mismatch", "depth")
                 depth_flag &= ~curve_outliers_d
 
     # Diurnal baseline anomalies
+    depth_flag_pre = depth_flag.copy()
+    vel_flag_pre = vel_flag.copy()
     depth_flag, vel_flag = detect_diurnal_baseline_anomalies(
         df,
         depth_flag,
@@ -577,10 +826,14 @@ def apply_quality_checks(
         k=5.0,
         min_run_bins=6,
     )
+    tracker.add(depth_flag_pre & (~depth_flag), "diurnal_anomaly", "depth")
+    tracker.add(vel_flag_pre & (~vel_flag), "diurnal_anomaly", "velocity")
 
     df["depth_flag"] = depth_flag
     df["velocity_flag"] = vel_flag
-    return d_knots, v_knots, v_expected, d_expected
+    df["depth_anomaly_codes"] = tracker.series("depth")
+    df["velocity_anomaly_codes"] = tracker.series("velocity")
+    return d_knots, v_knots, v_expected, d_expected, tracker
 
 
 def compute_diurnal_profiles(
@@ -628,6 +881,7 @@ def apply_diurnal_infill(
     depth_profile: Optional[pd.DataFrame],
     vel_profile: Optional[pd.DataFrame],
     diurnal_freq: str = "15min",
+    anomaly_tracker: Optional[AnomalyTracker] = None,
 ):
     """
     Use diurnal profiles to fill remaining NaNs in depth_clean / velocity_clean
@@ -650,6 +904,8 @@ def apply_diurnal_infill(
             use_diurnal_depth = missing_depth & diurnal_depth_vals.notna()
             df.loc[use_diurnal_depth, "depth_clean"] = diurnal_depth_vals[use_diurnal_depth]
             df.loc[use_diurnal_depth, "depth_source"] = "diurnal_profile"
+            if anomaly_tracker is not None:
+                anomaly_tracker.add(use_diurnal_depth, "diurnal_infill", "depth")
 
     if vel_profile is not None:
         missing_vel = df["velocity_clean"].isna()
@@ -659,6 +915,8 @@ def apply_diurnal_infill(
             use_diurnal_vel = missing_vel & diurnal_vel_vals.notna()
             df.loc[use_diurnal_vel, "velocity_clean"] = diurnal_vel_vals[use_diurnal_vel]
             df.loc[use_diurnal_vel, "velocity_source"] = "diurnal_profile"
+            if anomaly_tracker is not None:
+                anomaly_tracker.add(use_diurnal_vel, "diurnal_infill", "velocity")
 
     df = df.drop(columns=["tod_bin"])
     df = df.reset_index()
@@ -669,6 +927,7 @@ def interpolate_signals(
     df: pd.DataFrame,
     v_expected,
     d_expected,
+    anomaly_tracker: Optional[AnomalyTracker] = None,
     diurnal_freq: str = "15min",
     diurnal_min_samples: int = 5,
     depth_min_meas: Optional[float] = None,
@@ -687,6 +946,7 @@ def interpolate_signals(
     and a global minimum of 0.01 m/s is applied to velocity_clean.
     """
     df = df.copy()
+    tracker = anomaly_tracker or AnomalyTracker(df.index)
 
     depth_profile, vel_profile = compute_diurnal_profiles(
         df,
@@ -715,6 +975,7 @@ def interpolate_signals(
                 df.loc[mask_rating_vel, "depth_clean"]
             )
             df.loc[mask_rating_vel, "velocity_source"] = "rating_from_depth"
+            tracker.add(mask_rating_vel, "rating_curve_infill", "velocity")
 
         # Secondary: good velocity, bad depth (less common, but allowed).
         mask_rating_depth = depth_bad & (~vel_bad) & df["velocity_clean"].notna()
@@ -723,6 +984,7 @@ def interpolate_signals(
                 df.loc[mask_rating_depth, "velocity_clean"]
             )
             df.loc[mask_rating_depth, "depth_source"] = "rating_from_velocity"
+            tracker.add(mask_rating_depth, "rating_curve_infill", "depth")
 
     df = df.reset_index()
 
@@ -732,6 +994,7 @@ def interpolate_signals(
         depth_profile=depth_profile,
         vel_profile=vel_profile,
         diurnal_freq=diurnal_freq,
+        anomaly_tracker=tracker,
     )
 
     # 3) Hydraulic shape-preserving interpolation (monotone cubic)
@@ -745,6 +1008,7 @@ def interpolate_signals(
         depth_monotone_mask & (df["depth_source"] == "bad"),
         "depth_source",
     ] = "monotone_interp"
+    tracker.add(depth_monotone_mask, "shape_preserving_infill", "depth")
 
     vel_before = df["velocity_clean"].copy()
     vel_monotone = monotone_time_fill(df["velocity_clean"])
@@ -754,6 +1018,7 @@ def interpolate_signals(
         vel_monotone_mask & (df["velocity_source"] == "bad"),
         "velocity_source",
     ] = "monotone_interp"
+    tracker.add(vel_monotone_mask, "shape_preserving_infill", "velocity")
 
     # 4) Time interpolation fallback
     depth_before_time = df["depth_clean"].copy()
@@ -763,6 +1028,7 @@ def interpolate_signals(
         filled_depth_time & (df["depth_source"] == "bad"),
         "depth_source",
     ] = "time_interp"
+    tracker.add(filled_depth_time, "time_interpolation", "depth")
 
     vel_before_time = df["velocity_clean"].copy()
     df["velocity_clean"] = df["velocity_clean"].interpolate(method="time", limit_direction="both")
@@ -771,6 +1037,7 @@ def interpolate_signals(
         filled_vel_time & (df["velocity_source"] == "bad"),
         "velocity_source",
     ] = "time_interp"
+    tracker.add(filled_vel_time, "time_interpolation", "velocity")
 
     df = df.reset_index()
 
@@ -790,6 +1057,11 @@ def interpolate_signals(
         upper=vel_max_meas,
     )
 
+    depth_codes = tracker.series("depth")
+    velocity_codes = tracker.series("velocity")
+    df["depth_anomaly_codes"] = depth_codes.values
+    df["velocity_anomaly_codes"] = velocity_codes.values
+
     return df
 
 
@@ -805,6 +1077,61 @@ def circular_area_from_depth(depth: pd.Series, pipe_diam_m: float) -> pd.Series:
     theta = 2.0 * np.arccos(x)
     area = (R ** 2 / 2.0) * (theta - np.sin(theta))
     return pd.Series(area, index=depth.index)
+
+
+def circular_wetted_perimeter(depth: pd.Series, pipe_diam_m: float) -> pd.Series:
+    """Wetted perimeter (m) of a partially full circular pipe."""
+    R = pipe_diam_m / 2.0
+    if R <= 0:
+        return pd.Series(np.nan, index=depth.index)
+
+    h = depth.clip(lower=0.0, upper=2 * R)
+    x = (R - h) / R
+    x = x.clip(lower=-1.0, upper=1.0)
+    theta = 2.0 * np.arccos(x)
+    perimeter = theta * R
+    perimeter = perimeter.where(h > 0.0, other=0.0)
+    return pd.Series(perimeter, index=depth.index)
+
+
+def manning_velocity(
+    depth: pd.Series,
+    pipe_diam_m: Optional[float],
+    slope: Optional[float],
+    roughness_n: Optional[float],
+) -> pd.Series:
+    """Compute expected velocity (m/s) from Manning's equation."""
+    if pipe_diam_m is None or slope is None or roughness_n is None:
+        return pd.Series(np.nan, index=depth.index)
+    if pipe_diam_m <= 0 or slope <= 0 or roughness_n <= 0:
+        return pd.Series(np.nan, index=depth.index)
+
+    area = circular_area_from_depth(depth, pipe_diam_m)
+    perimeter = circular_wetted_perimeter(depth, pipe_diam_m)
+    hydraulic_radius = area / perimeter.replace(0.0, np.nan)
+    velocity = (1.0 / roughness_n) * (hydraulic_radius ** (2.0 / 3.0)) * np.sqrt(slope)
+    velocity = velocity.replace([np.inf, -np.inf], np.nan)
+    velocity = velocity.where(area.notna() & perimeter.notna(), np.nan)
+    return velocity
+
+
+def theoretical_full_pipe_capacity_lps(
+    pipe_diam_m: Optional[float],
+    slope: Optional[float],
+    roughness_n: Optional[float],
+) -> Optional[float]:
+    """Return theoretical full-pipe capacity in L/s when metadata is provided."""
+    if pipe_diam_m is None or slope is None or roughness_n is None:
+        return None
+    if pipe_diam_m <= 0 or slope <= 0 or roughness_n <= 0:
+        return None
+
+    radius = pipe_diam_m / 2.0
+    area = np.pi * radius ** 2
+    hydraulic_radius = pipe_diam_m / 4.0
+    velocity = (1.0 / roughness_n) * (hydraulic_radius ** (2.0 / 3.0)) * np.sqrt(slope)
+    flow_m3s = area * velocity
+    return float(flow_m3s * 1000.0)
 
 
 def add_flow_columns(df: pd.DataFrame, pipe_diam_m: Optional[float]) -> pd.DataFrame:
@@ -988,8 +1315,15 @@ def process_dataset(
     vel_max_meas: Optional[float],
     froude_max: float,
     gradient_k: float,
+    slope: Optional[float] = None,
+    roughness_n: Optional[float] = None,
+    hydraulic_tolerance: float = 0.35,
+    full_pipe_capacity_lps: Optional[float] = None,
+    capacity_tolerance: float = 0.1,
+    condition_labels: Optional[pd.Series] = None,
+    rainfall_context: Optional[Dict[str, pd.Series]] = None,
 ):
-    d_knots, v_knots, v_expected, d_expected = apply_quality_checks(
+    d_knots, v_knots, v_expected, d_expected, tracker = apply_quality_checks(
         df,
         pipe_diam_m=pipe_diam_m,
         flatline_run=flatline_run,
@@ -1003,6 +1337,16 @@ def process_dataset(
         vel_max_meas=vel_max_meas,
         froude_max=froude_max,
         gradient_k=gradient_k,
+        slope=slope,
+        roughness_n=roughness_n,
+        hydraulic_tolerance=hydraulic_tolerance,
+        full_pipe_capacity_lps=full_pipe_capacity_lps,
+        capacity_tolerance=capacity_tolerance,
+        condition_labels=(
+            condition_labels
+            if condition_labels is not None
+            else rainfall_context.get("condition_label") if rainfall_context else None
+        ),
     )
 
     if v_expected is None or d_expected is None:
@@ -1013,6 +1357,7 @@ def process_dataset(
         df,
         v_expected,
         d_expected,
+        anomaly_tracker=tracker,
         diurnal_freq=diurnal_freq,
         diurnal_min_samples=diurnal_min_samples,
         depth_min_meas=depth_min_meas,
@@ -1020,6 +1365,15 @@ def process_dataset(
         vel_min_meas=vel_min_meas,
         vel_max_meas=vel_max_meas,
     )
+    if rainfall_context is not None:
+        for key, series in rainfall_context.items():
+            df_clean[key] = series.values
+    if rainfall_context is not None and "condition_label" in rainfall_context:
+        df_clean["dwf_wwf"] = np.where(
+            rainfall_context["is_wet_weather"],
+            "wet_weather",
+            "dry_weather",
+        )
     df_clean = add_flow_columns(df_clean, pipe_diam_m)
     df_clean = assign_quality_labels(df_clean)
     stats = qc_stats(df_clean, pipe_diam_m)
