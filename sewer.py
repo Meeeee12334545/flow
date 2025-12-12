@@ -1909,6 +1909,7 @@ what was raw vs interpolated.
 """
     )
 
+    max_grid_rows = 5000
     allow_detailed_editor = len(df_clean) <= max_grid_rows
     if allow_detailed_editor:
         edited_df = st.data_editor(
