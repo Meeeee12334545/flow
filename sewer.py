@@ -1788,10 +1788,14 @@ if st.session_state.df_clean is not None:
         velocity_status = velocity_status.map({True: "manual_good", False: "manual_bad"}).fillna("unmarked")
 
     plot_df = df_clean[selection_cols].copy()
+    plot_df["timestamp"] = pd.to_datetime(plot_df["timestamp"])
     plot_df["row_id"] = df_clean.index
-    plot_df["order_idx"] = np.arange(len(plot_df))
     plot_df["depth_status"] = depth_status.values
     plot_df["velocity_status"] = velocity_status.values
+    plot_df["order_idx"] = np.arange(len(plot_df))
+
+    # Sort for plotting to avoid diagonal artifacts; keep row_id for mapping
+    plot_df_sorted = plot_df.sort_values("timestamp").reset_index(drop=True)
 
     def update_manual_mask(name: str, base: pd.Series, row_ids: List[int], value: bool):
         mask = current_manual_mask(name, base).copy()
@@ -1824,40 +1828,51 @@ if st.session_state.df_clean is not None:
         y_label: str,
     ):
         fig = go.Figure()
+
+        x_sorted = plot_df_sorted["timestamp"]
+        y_raw_sorted = plot_df_sorted[y_raw]
+        y_clean_sorted = plot_df_sorted[y_clean]
+
         fig.add_trace(
             go.Scatter(
-                x=plot_df["timestamp"],
-                y=plot_df[y_raw],
-                mode="lines",
+                x=x_sorted,
+                y=y_raw_sorted,
+                mode="lines+markers",
                 name=f"{y_label} raw",
                 line=dict(color="#9e9e9e", width=1),
+                marker=dict(size=4, opacity=0.4),
+                hovertemplate="%{y:.3f}<br>%{x}<extra></extra>",
             )
         )
         fig.add_trace(
             go.Scatter(
-                x=plot_df["timestamp"],
-                y=plot_df[y_clean],
-                mode="lines",
+                x=x_sorted,
+                y=y_clean_sorted,
+                mode="lines+markers",
                 name=f"{y_label} cleaned",
                 line=dict(color="#1f77b4", width=2),
+                marker=dict(size=5, opacity=0.6),
+                hovertemplate="%{y:.3f}<br>%{x}<extra></extra>",
             )
         )
+
         marker_colors = None
         marker_text = None
-        if status_col and status_col in plot_df.columns:
-            marker_colors = category_colors(plot_df[status_col])
-            marker_text = plot_df[status_col].astype(str)
-        elif quality_col and quality_col in plot_df.columns:
-            marker_colors = category_colors(plot_df[quality_col])
-            marker_text = plot_df[quality_col].astype(str)
+        if status_col and status_col in plot_df_sorted.columns:
+            marker_colors = category_colors(plot_df_sorted[status_col])
+            marker_text = plot_df_sorted[status_col].astype(str)
+        elif quality_col and quality_col in plot_df_sorted.columns:
+            marker_colors = category_colors(plot_df_sorted[quality_col])
+            marker_text = plot_df_sorted[quality_col].astype(str)
+
         fig.add_trace(
             go.Scatter(
-                x=plot_df["timestamp"],
-                y=plot_df[y_clean],
+                x=x_sorted,
+                y=y_clean_sorted,
                 mode="markers",
                 name="Select points",
-                marker=dict(size=7, color=marker_colors, opacity=0.9),
-                customdata=np.stack([plot_df["row_id"], plot_df["order_idx"]], axis=1),
+                marker=dict(size=9, color=marker_colors, opacity=0.95, line=dict(width=0.5, color="#000")),
+                customdata=np.stack([plot_df_sorted["row_id"], plot_df_sorted["order_idx"]], axis=1),
                 hovertemplate="%{y:.3f}<br>%{x}<br>%{text}<extra></extra>",
                 text=marker_text,
             )
@@ -1868,7 +1883,8 @@ if st.session_state.df_clean is not None:
             xaxis_title="Timestamp",
             yaxis_title=y_label,
             legend_title="Series",
-            height=400,
+            height=420,
+            xaxis=dict(type="date"),
         )
         return fig
 
