@@ -1832,26 +1832,29 @@ if st.session_state.df_clean is not None:
         x_sorted = plot_df_sorted["timestamp"]
         y_raw_sorted = plot_df_sorted[y_raw]
         y_clean_sorted = plot_df_sorted[y_clean]
+        total_points = len(plot_df_sorted)
+        use_webgl = total_points > 4000
+        scatter_cls = go.Scattergl if use_webgl else go.Scatter
 
         fig.add_trace(
-            go.Scatter(
+            scatter_cls(
                 x=x_sorted,
                 y=y_raw_sorted,
                 mode="lines+markers",
                 name=f"{y_label} raw",
                 line=dict(color="#9e9e9e", width=1),
-                marker=dict(size=4, opacity=0.4),
+                marker=dict(size=4, opacity=0.35 if use_webgl else 0.4),
                 hovertemplate="%{y:.3f}<br>%{x}<extra></extra>",
             )
         )
         fig.add_trace(
-            go.Scatter(
+            scatter_cls(
                 x=x_sorted,
                 y=y_clean_sorted,
                 mode="lines+markers",
                 name=f"{y_label} cleaned",
                 line=dict(color="#1f77b4", width=2),
-                marker=dict(size=5, opacity=0.6),
+                marker=dict(size=5, opacity=0.55 if use_webgl else 0.6),
                 hovertemplate="%{y:.3f}<br>%{x}<extra></extra>",
             )
         )
@@ -1865,8 +1868,9 @@ if st.session_state.df_clean is not None:
             marker_colors = category_colors(plot_df_sorted[quality_col])
             marker_text = plot_df_sorted[quality_col].astype(str)
 
+        selection_scatter_cls = go.Scattergl if use_webgl else go.Scatter
         fig.add_trace(
-            go.Scatter(
+            selection_scatter_cls(
                 x=x_sorted,
                 y=y_clean_sorted,
                 mode="markers",
@@ -1885,6 +1889,7 @@ if st.session_state.df_clean is not None:
             legend_title="Series",
             height=420,
             xaxis=dict(type="date"),
+            uirevision=title,
         )
         return fig
 
@@ -2044,22 +2049,35 @@ if st.session_state.df_clean is not None:
         }
     )
 
-    manual_selector_editor = st.data_editor(
-        manual_selector_source,
-        num_rows="fixed",
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "timestamp": st.column_config.DatetimeColumn("Timestamp", disabled=True),
-            "depth": st.column_config.NumberColumn("Depth (m)", disabled=True, format="%.3f"),
-            "velocity": st.column_config.NumberColumn("Velocity (m/s)", disabled=True, format="%.3f"),
-            "qc_depth_flag": st.column_config.CheckboxColumn("QC depth good", disabled=True),
-            "qc_velocity_flag": st.column_config.CheckboxColumn("QC velocity good", disabled=True),
-            "manual_depth_good": st.column_config.CheckboxColumn("Manual depth good"),
-            "manual_velocity_good": st.column_config.CheckboxColumn("Manual velocity good"),
-        },
-        key="manual_selector_editor",
-    )
+    max_grid_rows = 5000
+    if len(manual_selector_source) > max_grid_rows:
+        st.info(
+            "Dataset is large; grid-based manual toggles are disabled to avoid browser freezes. "
+            "Use the selection tools or the time range actions above to adjust masks."
+        )
+        st.dataframe(
+            manual_selector_source,
+            use_container_width=True,
+            hide_index=True,
+        )
+        manual_selector_editor = manual_selector_source.copy()
+    else:
+        manual_selector_editor = st.data_editor(
+            manual_selector_source,
+            num_rows="fixed",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "timestamp": st.column_config.DatetimeColumn("Timestamp", disabled=True),
+                "depth": st.column_config.NumberColumn("Depth (m)", disabled=True, format="%.3f"),
+                "velocity": st.column_config.NumberColumn("Velocity (m/s)", disabled=True, format="%.3f"),
+                "qc_depth_flag": st.column_config.CheckboxColumn("QC depth good", disabled=True),
+                "qc_velocity_flag": st.column_config.CheckboxColumn("QC velocity good", disabled=True),
+                "manual_depth_good": st.column_config.CheckboxColumn("Manual depth good"),
+                "manual_velocity_good": st.column_config.CheckboxColumn("Manual velocity good"),
+            },
+            key="manual_selector_editor",
+        )
 
     if st.button("Rebuild using manual selections", type="primary"):
         if st.session_state.raw_df is None or st.session_state.last_run_params is None:
@@ -2220,14 +2238,26 @@ what was raw vs interpolated.
 """
     )
 
-    edited_df = st.data_editor(
-        df_clean,
-        num_rows="fixed",
-        use_container_width=True,
-        key="editor_table",
-    )
+    allow_detailed_editor = len(df_clean) <= max_grid_rows
+    if allow_detailed_editor:
+        edited_df = st.data_editor(
+            df_clean,
+            num_rows="fixed",
+            use_container_width=True,
+            key="editor_table",
+        )
+    else:
+        st.info(
+            "Full-table editing skipped for large datasets. Download the cleaned CSV for extensive edits "
+            "or apply targeted adjustments with the tools above."
+        )
+        st.dataframe(df_clean, use_container_width=True)
+        edited_df = df_clean
 
-    if st.button("Apply manual edits & recompute flow"):
+    if st.button(
+        "Apply manual edits & recompute flow",
+        disabled=not allow_detailed_editor,
+    ):
         df_manual = edited_df.copy()
         df_manual = add_flow_columns(df_manual, pipe_diam_m_saved)
         df_manual = assign_quality_labels(df_manual)
