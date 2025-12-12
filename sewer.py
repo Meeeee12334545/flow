@@ -1797,6 +1797,48 @@ if st.session_state.df_clean is not None:
     # Sort for plotting to avoid diagonal artifacts; keep row_id for mapping
     plot_df_sorted = plot_df.sort_values("timestamp").reset_index(drop=True)
 
+    max_chart_points = 12000
+    chart_df = plot_df_sorted.copy()
+    total_points = len(chart_df)
+    if total_points > max_chart_points:
+        st.warning(
+            "Large dataset detected. Showing a limited time window to keep charts responsive. "
+            "Adjust the window below to review different periods."
+        )
+        ts_min = chart_df["timestamp"].iloc[0].to_pydatetime()
+        ts_max = chart_df["timestamp"].iloc[-1].to_pydatetime()
+        default_end_idx = min(max_chart_points - 1, total_points - 1)
+        default_end = chart_df["timestamp"].iloc[default_end_idx].to_pydatetime()
+        default_range = (ts_min, default_end)
+        range_start_dt, range_end_dt = st.slider(
+            "Select chart window",
+            min_value=ts_min,
+            max_value=ts_max,
+            value=default_range,
+            format="%Y-%m-%d %H:%M",
+            key="selection_window_slider",
+        )
+        range_start = pd.Timestamp(range_start_dt)
+        range_end = pd.Timestamp(range_end_dt)
+        if range_start > range_end:
+            range_start, range_end = range_end, range_start
+        window_mask = (chart_df["timestamp"] >= range_start) & (chart_df["timestamp"] <= range_end)
+        window_df = chart_df[window_mask].copy()
+        if window_df.empty:
+            window_df = chart_df.iloc[:max_chart_points].copy()
+        elif len(window_df) > max_chart_points:
+            window_df = window_df.iloc[:max_chart_points].copy()
+            st.info("Window trimmed to the first 12,000 points for stability.")
+        chart_df = window_df
+        st.caption(f"Displaying {len(chart_df)} of {total_points} total points in the selection charts.")
+
+    use_webgl_selection = st.checkbox(
+        "Use WebGL rendering for selection charts (faster, requires browser support)",
+        value=False,
+        key="use_webgl_selection_checkbox",
+        help="Enable if your browser supports WebGL; disable if you encounter WebGL errors or blank charts.",
+    )
+
     def update_manual_mask(name: str, base: pd.Series, row_ids: List[int], value: bool):
         mask = current_manual_mask(name, base).copy()
         if row_ids:
@@ -1820,6 +1862,8 @@ if st.session_state.df_clean is not None:
         return series.map(palette).fillna("#7f7f7f")
 
     def make_selection_chart(
+        source_df: pd.DataFrame,
+        allow_webgl: bool,
         y_raw: str,
         y_clean: str,
         quality_col: Optional[str],
@@ -1829,11 +1873,11 @@ if st.session_state.df_clean is not None:
     ):
         fig = go.Figure()
 
-        x_sorted = plot_df_sorted["timestamp"]
-        y_raw_sorted = plot_df_sorted[y_raw]
-        y_clean_sorted = plot_df_sorted[y_clean]
-        total_points = len(plot_df_sorted)
-        use_webgl = total_points > 4000
+        x_sorted = source_df["timestamp"]
+        y_raw_sorted = source_df[y_raw]
+        y_clean_sorted = source_df[y_clean]
+        total_points = len(source_df)
+        use_webgl = allow_webgl and total_points > 2000
         scatter_cls = go.Scattergl if use_webgl else go.Scatter
 
         fig.add_trace(
@@ -1861,12 +1905,12 @@ if st.session_state.df_clean is not None:
 
         marker_colors = None
         marker_text = None
-        if status_col and status_col in plot_df_sorted.columns:
-            marker_colors = category_colors(plot_df_sorted[status_col])
-            marker_text = plot_df_sorted[status_col].astype(str)
-        elif quality_col and quality_col in plot_df_sorted.columns:
-            marker_colors = category_colors(plot_df_sorted[quality_col])
-            marker_text = plot_df_sorted[quality_col].astype(str)
+        if status_col and status_col in source_df.columns:
+            marker_colors = category_colors(source_df[status_col])
+            marker_text = source_df[status_col].astype(str)
+        elif quality_col and quality_col in source_df.columns:
+            marker_colors = category_colors(source_df[quality_col])
+            marker_text = source_df[quality_col].astype(str)
 
         selection_scatter_cls = go.Scattergl if use_webgl else go.Scatter
         fig.add_trace(
@@ -1876,7 +1920,7 @@ if st.session_state.df_clean is not None:
                 mode="markers",
                 name="Select points",
                 marker=dict(size=9, color=marker_colors, opacity=0.95, line=dict(width=0.5, color="#000")),
-                customdata=np.stack([plot_df_sorted["row_id"], plot_df_sorted["order_idx"]], axis=1),
+                customdata=np.stack([source_df["row_id"], source_df["order_idx"]], axis=1),
                 hovertemplate="%{y:.3f}<br>%{x}<br>%{text}<extra></extra>",
                 text=marker_text,
             )
@@ -1909,6 +1953,8 @@ if st.session_state.df_clean is not None:
     # Depth selection chart (raw + cleaned on time x-axis)
     st.markdown("#### Depth selection (time on X)")
     fig_depth_select = make_selection_chart(
+        chart_df,
+        use_webgl_selection,
         y_raw="depth",
         y_clean="depth_clean",
         quality_col="depth_quality" if "depth_quality" in plot_df.columns else None,
@@ -1947,6 +1993,8 @@ if st.session_state.df_clean is not None:
     # Velocity selection chart (raw + cleaned on time x-axis)
     st.markdown("#### Velocity selection (time on X)")
     fig_vel_select = make_selection_chart(
+        chart_df,
+        use_webgl_selection,
         y_raw="velocity",
         y_clean="velocity_clean",
         quality_col="velocity_quality" if "velocity_quality" in plot_df.columns else None,
