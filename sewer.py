@@ -1577,10 +1577,6 @@ if "raw_df" not in st.session_state:
     st.session_state.raw_df = None
 if "last_run_params" not in st.session_state:
     st.session_state.last_run_params = None
-if "manual_depth_mask" not in st.session_state:
-    st.session_state.manual_depth_mask = None
-if "manual_velocity_mask" not in st.session_state:
-    st.session_state.manual_velocity_mask = None
 
 if uploaded_file is None:
     st.info("Upload a CSV file to begin.")
@@ -1611,8 +1607,6 @@ else:
             st.session_state.df_clean = df_clean
             st.session_state.pipe_diam_m = pipe_diam_m
             st.session_state.raw_df = raw_df.copy()
-            st.session_state.manual_depth_mask = None
-            st.session_state.manual_velocity_mask = None
             st.session_state.last_run_params = {
                 "pipe_diam_m": pipe_diam_m,
                 "flatline_run": int(flatline_run),
@@ -1730,434 +1724,63 @@ if st.session_state.df_clean is not None:
     else:
         st.markdown("_Cleaned depth–velocity relationship: not enough data to compute._")
 
-    st.subheader("Manual Good/Bad Selection for Interpolation")
-    st.markdown(
-        "Mark the samples you trust as hydraulically sound. Only these rows will seed "
-        "rating-curve and diurnal infill on the next rebuild, while unchecked rows are "
-        "treated as bad and will be regenerated."
+    st.subheader("Depth & velocity hydrograph")
+    hydro_fig = go.Figure()
+    hydro_fig.add_trace(
+        go.Scatter(
+            x=df_clean["timestamp"],
+            y=df_clean["depth"],
+            mode="lines",
+            name="Depth (raw)",
+            line=dict(color="#9e9e9e", width=1),
+            hovertemplate="Depth raw: %{y:.3f} m<br>%{x}<extra></extra>",
+        )
     )
-
-    qc_depth_reference = (
-        df_clean["depth_flag_auto"]
-        if "depth_flag_auto" in df_clean.columns
-        else df_clean["depth_flag"]
+    hydro_fig.add_trace(
+        go.Scatter(
+            x=df_clean["timestamp"],
+            y=df_clean["depth_clean"],
+            mode="lines",
+            name="Depth (cleaned)",
+            line=dict(color="#1f77b4", width=2),
+            hovertemplate="Depth cleaned: %{y:.3f} m<br>%{x}<extra></extra>",
+        )
     )
-    qc_velocity_reference = (
-        df_clean["velocity_flag_auto"]
-        if "velocity_flag_auto" in df_clean.columns
-        else df_clean["velocity_flag"]
+    hydro_fig.add_trace(
+        go.Scatter(
+            x=df_clean["timestamp"],
+            y=df_clean["velocity"],
+            mode="lines",
+            name="Velocity (raw)",
+            line=dict(color="#ff7f0e", width=1, dash="dot"),
+            hovertemplate="Velocity raw: %{y:.3f} m/s<br>%{x}<extra></extra>",
+            yaxis="y2",
+        )
     )
-
-    base_depth_defaults = df_clean["depth_flag"].astype(bool)
-    base_velocity_defaults = df_clean["velocity_flag"].astype(bool)
-
-    def current_manual_mask(name: str, base: pd.Series) -> pd.Series:
-        mask = st.session_state.get(name)
-        if isinstance(mask, pd.Series) and len(mask) == len(base):
-            return mask.reindex(base.index).fillna(base).astype(bool)
-        return base.astype(bool)
-
-    manual_depth_defaults = current_manual_mask("manual_depth_mask", base_depth_defaults)
-    manual_velocity_defaults = current_manual_mask("manual_velocity_mask", base_velocity_defaults)
-
-    # Graphical selection helper
-    st.markdown("### Graphical selection assistant")
-
-    selection_cols = [
-        "timestamp",
-        "depth",
-        "velocity",
-        "depth_clean",
-        "velocity_clean",
-    ]
-    if "depth_quality" in df_clean.columns:
-        selection_cols.append("depth_quality")
-    if "velocity_quality" in df_clean.columns:
-        selection_cols.append("velocity_quality")
-
-    # Manual status labels for coloring
-    depth_manual_mask = st.session_state.get("manual_depth_mask")
-    velocity_manual_mask = st.session_state.get("manual_velocity_mask")
-    depth_status = pd.Series("unmarked", index=df_clean.index)
-    velocity_status = pd.Series("unmarked", index=df_clean.index)
-    if isinstance(depth_manual_mask, pd.Series) and len(depth_manual_mask) == len(df_clean):
-        depth_status = depth_manual_mask.reindex(df_clean.index)
-        depth_status = depth_status.map({True: "manual_good", False: "manual_bad"}).fillna("unmarked")
-    if isinstance(velocity_manual_mask, pd.Series) and len(velocity_manual_mask) == len(df_clean):
-        velocity_status = velocity_manual_mask.reindex(df_clean.index)
-        velocity_status = velocity_status.map({True: "manual_good", False: "manual_bad"}).fillna("unmarked")
-
-    plot_df = df_clean[selection_cols].copy()
-    plot_df["timestamp"] = pd.to_datetime(plot_df["timestamp"])
-    plot_df["row_id"] = df_clean.index
-    plot_df["depth_status"] = depth_status.values
-    plot_df["velocity_status"] = velocity_status.values
-    plot_df["order_idx"] = np.arange(len(plot_df))
-
-    # Sort for plotting to avoid diagonal artifacts; keep row_id for mapping
-    plot_df_sorted = plot_df.sort_values("timestamp").reset_index(drop=True)
-
-    max_chart_points = 12000
-    chart_df = plot_df_sorted.copy()
-    total_points = len(chart_df)
-    if total_points > max_chart_points:
-        st.warning(
-            "Large dataset detected. Showing a limited time window to keep charts responsive. "
-            "Adjust the window below to review different periods."
+    hydro_fig.add_trace(
+        go.Scatter(
+            x=df_clean["timestamp"],
+            y=df_clean["velocity_clean"],
+            mode="lines",
+            name="Velocity (cleaned)",
+            line=dict(color="#d62728", width=2),
+            hovertemplate="Velocity cleaned: %{y:.3f} m/s<br>%{x}<extra></extra>",
+            yaxis="y2",
         )
-        ts_min = chart_df["timestamp"].iloc[0].to_pydatetime()
-        ts_max = chart_df["timestamp"].iloc[-1].to_pydatetime()
-        default_end_idx = min(max_chart_points - 1, total_points - 1)
-        default_end = chart_df["timestamp"].iloc[default_end_idx].to_pydatetime()
-        default_range = (ts_min, default_end)
-        range_start_dt, range_end_dt = st.slider(
-            "Select chart window",
-            min_value=ts_min,
-            max_value=ts_max,
-            value=default_range,
-            format="%Y-%m-%d %H:%M",
-            key="selection_window_slider",
-        )
-        range_start = pd.Timestamp(range_start_dt)
-        range_end = pd.Timestamp(range_end_dt)
-        if range_start > range_end:
-            range_start, range_end = range_end, range_start
-        window_mask = (chart_df["timestamp"] >= range_start) & (chart_df["timestamp"] <= range_end)
-        window_df = chart_df[window_mask].copy()
-        if window_df.empty:
-            window_df = chart_df.iloc[:max_chart_points].copy()
-        elif len(window_df) > max_chart_points:
-            window_df = window_df.iloc[:max_chart_points].copy()
-            st.info("Window trimmed to the first 12,000 points for stability.")
-        chart_df = window_df
-        st.caption(f"Displaying {len(chart_df)} of {total_points} total points in the selection charts.")
-
-    use_webgl_selection = st.checkbox(
-        "Use WebGL rendering for selection charts (faster, requires browser support)",
-        value=False,
-        key="use_webgl_selection_checkbox",
-        help="Enable if your browser supports WebGL; disable if you encounter WebGL errors or blank charts.",
     )
-
-    def update_manual_mask(name: str, base: pd.Series, row_ids: List[int], value: bool):
-        mask = current_manual_mask(name, base).copy()
-        if row_ids:
-            mask.loc[row_ids] = value
-        st.session_state[name] = mask
-
-    def category_colors(series: pd.Series, palette=None) -> pd.Series:
-        if palette is None:
-            palette = {
-                "manual_good": "#2ca02c",
-                "manual_bad": "#d62728",
-                "good_raw": "#1f77b4",
-                "inferred_rating": "#2ca02c",
-                "inferred_diurnal": "#ff7f0e",
-                "inferred_shape": "#9467bd",
-                "inferred_time": "#8c564b",
-                "raw_bad": "#d62728",
-                "missing": "#7f7f7f",
-                "unmarked": "#7f7f7f",
-            }
-        return series.map(palette).fillna("#7f7f7f")
-
-    def make_selection_chart(
-        source_df: pd.DataFrame,
-        allow_webgl: bool,
-        y_raw: str,
-        y_clean: str,
-        quality_col: Optional[str],
-        status_col: Optional[str],
-        title: str,
-        y_label: str,
-    ):
-        fig = go.Figure()
-
-        x_sorted = source_df["timestamp"]
-        y_raw_sorted = source_df[y_raw]
-        y_clean_sorted = source_df[y_clean]
-        total_points = len(source_df)
-        use_webgl = allow_webgl and total_points > 2000
-        scatter_cls = go.Scattergl if use_webgl else go.Scatter
-
-        fig.add_trace(
-            scatter_cls(
-                x=x_sorted,
-                y=y_raw_sorted,
-                mode="lines+markers",
-                name=f"{y_label} raw",
-                line=dict(color="#9e9e9e", width=1),
-                marker=dict(size=4, opacity=0.35 if use_webgl else 0.4),
-                hovertemplate="%{y:.3f}<br>%{x}<extra></extra>",
-            )
-        )
-        fig.add_trace(
-            scatter_cls(
-                x=x_sorted,
-                y=y_clean_sorted,
-                mode="lines+markers",
-                name=f"{y_label} cleaned",
-                line=dict(color="#1f77b4", width=2),
-                marker=dict(size=5, opacity=0.55 if use_webgl else 0.6),
-                hovertemplate="%{y:.3f}<br>%{x}<extra></extra>",
-            )
-        )
-
-        marker_colors = None
-        marker_text = None
-        if status_col and status_col in source_df.columns:
-            marker_colors = category_colors(source_df[status_col])
-            marker_text = source_df[status_col].astype(str)
-        elif quality_col and quality_col in source_df.columns:
-            marker_colors = category_colors(source_df[quality_col])
-            marker_text = source_df[quality_col].astype(str)
-
-        selection_scatter_cls = go.Scattergl if use_webgl else go.Scatter
-        fig.add_trace(
-            selection_scatter_cls(
-                x=x_sorted,
-                y=y_clean_sorted,
-                mode="markers",
-                name="Select points",
-                marker=dict(size=9, color=marker_colors, opacity=0.95, line=dict(width=0.5, color="#000")),
-                customdata=np.stack([source_df["row_id"], source_df["order_idx"]], axis=1),
-                hovertemplate="%{y:.3f}<br>%{x}<br>%{text}<extra></extra>",
-                text=marker_text,
-            )
-        )
-        fig.update_layout(
-            title=title,
-            dragmode="select",
-            xaxis_title="Timestamp",
-            yaxis_title=y_label,
-            legend_title="Series",
-            height=420,
-            xaxis=dict(type="date"),
-            uirevision=title,
-        )
-        return fig
-
-    def extract_row_ids(events: List[Dict[str, Any]]) -> List[int]:
-        row_ids: List[int] = []
-        if not events:
-            return row_ids
-        for pt in events:
-            cd = pt.get("customdata")
-            if isinstance(cd, (list, tuple)) and len(cd) >= 1:
-                try:
-                    row_ids.append(int(cd[0]))
-                except Exception:
-                    continue
-        return row_ids
-
-    # Depth selection chart (raw + cleaned on time x-axis)
-    st.markdown("#### Depth selection (time on X)")
-    fig_depth_select = make_selection_chart(
-        chart_df,
-        use_webgl_selection,
-        y_raw="depth",
-        y_clean="depth_clean",
-        quality_col="depth_quality" if "depth_quality" in plot_df.columns else None,
-        status_col="depth_status",
-        title="Depth over time (select to flag good/bad)",
-        y_label="Depth (m)",
+    hydro_fig.update_layout(
+        height=480,
+        xaxis=dict(title="Timestamp"),
+        yaxis=dict(title="Depth (m)"),
+        yaxis2=dict(
+            title="Velocity (m/s)",
+            overlaying="y",
+            side="right",
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
+        margin=dict(t=60, r=40, b=60, l=60),
     )
-    depth_events = plotly_events(
-        fig_depth_select,
-        select_event=True,
-        override_height=400,
-        key="depth_plotly_select",
-    )
-    depth_row_ids = extract_row_ids(depth_events)
-    if depth_row_ids:
-        st.info(f"Depth chart: selected {len(depth_row_ids)} samples.")
-
-    depth_cols = st.columns(2)
-    if depth_cols[0].button(
-        "Mark depth selection as good",
-        disabled=not depth_row_ids,
-        key="btn_depth_select_good",
-    ):
-        update_manual_mask("manual_depth_mask", base_depth_defaults, depth_row_ids, True)
-        st.success("Depth selection marked as trusted.")
-        st.rerun()
-    if depth_cols[1].button(
-        "Mark depth selection as bad",
-        disabled=not depth_row_ids,
-        key="btn_depth_select_bad",
-    ):
-        update_manual_mask("manual_depth_mask", base_depth_defaults, depth_row_ids, False)
-        st.success("Depth selection marked as bad.")
-        st.rerun()
-
-    # Velocity selection chart (raw + cleaned on time x-axis)
-    st.markdown("#### Velocity selection (time on X)")
-    fig_vel_select = make_selection_chart(
-        chart_df,
-        use_webgl_selection,
-        y_raw="velocity",
-        y_clean="velocity_clean",
-        quality_col="velocity_quality" if "velocity_quality" in plot_df.columns else None,
-        status_col="velocity_status",
-        title="Velocity over time (select to flag good/bad)",
-        y_label="Velocity (m/s)",
-    )
-    velocity_events = plotly_events(
-        fig_vel_select,
-        select_event=True,
-        override_height=400,
-        key="velocity_plotly_select",
-    )
-    velocity_row_ids = extract_row_ids(velocity_events)
-    if velocity_row_ids:
-        st.info(f"Velocity chart: selected {len(velocity_row_ids)} samples.")
-
-    velocity_cols = st.columns(2)
-    if velocity_cols[0].button(
-        "Mark velocity selection as good",
-        disabled=not velocity_row_ids,
-        key="btn_vel_select_good",
-    ):
-        update_manual_mask("manual_velocity_mask", base_velocity_defaults, velocity_row_ids, True)
-        st.success("Velocity selection marked as trusted.")
-        st.rerun()
-    if velocity_cols[1].button(
-        "Mark velocity selection as bad",
-        disabled=not velocity_row_ids,
-        key="btn_vel_select_bad",
-    ):
-        update_manual_mask("manual_velocity_mask", base_velocity_defaults, velocity_row_ids, False)
-        st.success("Velocity selection marked as bad.")
-        st.rerun()
-
-    # Time-range selector on x-axis
-    st.markdown("#### Time range overrides")
-    if not df_clean["timestamp"].empty:
-        ts_min = df_clean["timestamp"].min().to_pydatetime()
-        ts_max = df_clean["timestamp"].max().to_pydatetime()
-        range_start_py, range_end_py = st.slider(
-            "Select time window",
-            min_value=ts_min,
-            max_value=ts_max,
-            value=(ts_min, ts_max),
-            format="%Y-%m-%d %H:%M",
-            key="time_range_slider",
-        )
-        range_start = pd.Timestamp(range_start_py)
-        range_end = pd.Timestamp(range_end_py)
-        if range_start > range_end:
-            range_start, range_end = range_end, range_start
-        range_mask = (df_clean["timestamp"] >= range_start) & (df_clean["timestamp"] <= range_end)
-        range_row_ids = df_clean.index[range_mask].tolist()
-        st.caption(f"{range_mask.sum()} samples within selected window.")
-
-        range_cols = st.columns(4)
-        if range_cols[0].button(
-            "Depth: mark range good",
-            disabled=not range_row_ids,
-            key="btn_range_depth_good",
-        ):
-            update_manual_mask("manual_depth_mask", base_depth_defaults, range_row_ids, True)
-            st.success("Marked range as trusted depth data.")
-            st.rerun()
-        if range_cols[1].button(
-            "Depth: mark range bad",
-            disabled=not range_row_ids,
-            key="btn_range_depth_bad",
-        ):
-            update_manual_mask("manual_depth_mask", base_depth_defaults, range_row_ids, False)
-            st.success("Marked range as bad depth data.")
-            st.rerun()
-        if range_cols[2].button(
-            "Velocity: mark range good",
-            disabled=not range_row_ids,
-            key="btn_range_vel_good",
-        ):
-            update_manual_mask("manual_velocity_mask", base_velocity_defaults, range_row_ids, True)
-            st.success("Marked range as trusted velocity data.")
-            st.rerun()
-        if range_cols[3].button(
-            "Velocity: mark range bad",
-            disabled=not range_row_ids,
-            key="btn_range_vel_bad",
-        ):
-            update_manual_mask("manual_velocity_mask", base_velocity_defaults, range_row_ids, False)
-            st.success("Marked range as bad velocity data.")
-            st.rerun()
-
-    manual_selector_source = pd.DataFrame(
-        {
-            "timestamp": df_clean["timestamp"],
-            "depth": df_clean["depth"],
-            "velocity": df_clean["velocity"],
-            "qc_depth_flag": qc_depth_reference.astype(bool),
-            "qc_velocity_flag": qc_velocity_reference.astype(bool),
-            "manual_depth_good": manual_depth_defaults,
-            "manual_velocity_good": manual_velocity_defaults,
-        }
-    )
-
-    max_grid_rows = 5000
-    if len(manual_selector_source) > max_grid_rows:
-        st.info(
-            "Dataset is large; grid-based manual toggles are disabled to avoid browser freezes. "
-            "Use the selection tools or the time range actions above to adjust masks."
-        )
-        st.dataframe(
-            manual_selector_source,
-            use_container_width=True,
-            hide_index=True,
-        )
-        manual_selector_editor = manual_selector_source.copy()
-    else:
-        manual_selector_editor = st.data_editor(
-            manual_selector_source,
-            num_rows="fixed",
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "timestamp": st.column_config.DatetimeColumn("Timestamp", disabled=True),
-                "depth": st.column_config.NumberColumn("Depth (m)", disabled=True, format="%.3f"),
-                "velocity": st.column_config.NumberColumn("Velocity (m/s)", disabled=True, format="%.3f"),
-                "qc_depth_flag": st.column_config.CheckboxColumn("QC depth good", disabled=True),
-                "qc_velocity_flag": st.column_config.CheckboxColumn("QC velocity good", disabled=True),
-                "manual_depth_good": st.column_config.CheckboxColumn("Manual depth good"),
-                "manual_velocity_good": st.column_config.CheckboxColumn("Manual velocity good"),
-            },
-            key="manual_selector_editor",
-        )
-
-    if st.button("Rebuild using manual selections", type="primary"):
-        if st.session_state.raw_df is None or st.session_state.last_run_params is None:
-            st.warning("Load a dataset and run analysis before applying manual selections.")
-        else:
-            try:
-                manual_depth_mask = pd.Series(
-                    manual_selector_editor["manual_depth_good"].astype(bool).values,
-                    index=st.session_state.raw_df.index,
-                    name="manual_depth_good",
-                )
-                manual_velocity_mask = pd.Series(
-                    manual_selector_editor["manual_velocity_good"].astype(bool).values,
-                    index=st.session_state.raw_df.index,
-                    name="manual_velocity_good",
-                )
-
-                new_df_clean, _ = process_dataset(
-                    st.session_state.raw_df.copy(),
-                    manual_depth_mask=manual_depth_mask,
-                    manual_velocity_mask=manual_velocity_mask,
-                    **st.session_state.last_run_params,
-                )
-
-                st.session_state.df_clean = new_df_clean
-                st.session_state.manual_depth_mask = manual_depth_mask
-                st.session_state.manual_velocity_mask = manual_velocity_mask
-                st.success("Manual selections applied. Interpolation rebuilt using trusted samples.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Failed to rebuild with manual selections: {e}")
-                st.exception(e)
+    st.plotly_chart(hydro_fig, use_container_width=True)
 
     with st.expander("Depth sources & quality breakdown"):
         st.markdown("**Depth source counts**")
